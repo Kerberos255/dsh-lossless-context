@@ -1,0 +1,3 @@
+- insert:
+    - id: lossless-context-settings
+      name: dsh-lossless-context

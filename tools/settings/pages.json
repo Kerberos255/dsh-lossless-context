@@ -1,0 +1,239 @@
+{
+  "dsh-lossless-context": {
+    "rowId": "lossless-context-settings",
+    "endpoint": "losslessContext",
+    "standalone": true,
+    "title": "无损上下文（LCM）",
+    "description": "使用原生压缩引擎分层整理上下文，保留原始会话并提供检索与展开。",
+    "fields": [
+      {
+        "key": "enabled",
+        "label": "使用 LCM",
+        "type": "boolean",
+        "help": "关闭时继续使用原生压缩策略；原始会话日志保留。"
+      },
+      {
+        "key": "automatic",
+        "label": "自动压缩",
+        "type": "boolean"
+      },
+      {
+        "key": "thresholdRatio",
+        "label": "触发比例",
+        "group": "压缩与模型预算",
+        "type": "number",
+        "min": 0.1,
+        "max": 0.95,
+        "step": "any",
+        "help": "按实际模型窗口计算，并扣除输出预留与安全余量。"
+      },
+      {
+        "key": "headroomTokens",
+        "label": "安全余量（token）",
+        "group": "压缩与模型预算",
+        "type": "number",
+        "min": 0,
+        "max": 1048576
+      },
+      {
+        "key": "retainRatio",
+        "label": "保留最近原文的比例",
+        "group": "压缩与模型预算",
+        "type": "number",
+        "min": 0.01,
+        "max": 0.5,
+        "step": "any"
+      },
+      {
+        "key": "retainTokens",
+        "label": "固定保留原文 token",
+        "group": "压缩与模型预算",
+        "type": "number",
+        "min": 0,
+        "max": 1048576,
+        "help": "0 使用比例；原生引擎始终保留完整工具配对。"
+      },
+      {
+        "key": "leafChunkTokens",
+        "label": "单个叶摘要的原文预算",
+        "group": "摘要与索引",
+        "type": "number",
+        "min": 512,
+        "max": 131072
+      },
+      {
+        "key": "condenseFanout",
+        "label": "合并摘要数量",
+        "group": "摘要与索引",
+        "type": "number",
+        "min": 2,
+        "max": 16
+      },
+      {
+        "key": "summaryMaxTokens",
+        "label": "首次摘要输出上限（token）",
+        "group": "摘要与索引",
+        "type": "number",
+        "min": 128,
+        "max": 65536,
+        "help": "首次调用的预算；完整性检查拒绝截断输出，再按下面的预算进行有限重试。"
+      },
+      {
+        "key": "summaryRetries",
+        "label": "截断后最多重试次数",
+        "group": "摘要与索引",
+        "type": "number",
+        "min": 0,
+        "max": 3,
+        "help": "0 关闭重试。只重试 token 上限截断；每次增长输出预算，取消和其他错误直接返回。"
+      },
+      {
+        "key": "summaryRetryMaxTokens",
+        "label": "重试增长上限（token）",
+        "group": "摘要与索引",
+        "type": "number",
+        "min": 128,
+        "max": 65536,
+        "help": "默认 16384，同时受模型剩余窗口限制；不高于首次上限时不增长。重试调用也会产生模型费用。"
+      },
+      {
+        "key": "summarizationProvider",
+        "label": "摘要提供方 ID",
+        "group": "摘要与索引",
+        "type": "text",
+        "help": "与模型 ID 同时填写；均留空时跟随会话模型。"
+      },
+      {
+        "key": "summarizationModel",
+        "label": "摘要模型 ID",
+        "group": "摘要与索引",
+        "type": "text"
+      },
+      {
+        "key": "modelPoliciesJson",
+        "label": "按模型覆盖压缩策略",
+        "group": "摘要与索引",
+        "type": "multiline",
+        "help": "JSON 数组，例如 [{\"provider\":\"opencode-go\",\"model\":\"deepseek-v4.1-flash\",\"thresholdRatio\":0.75}]。"
+      },
+      {
+        "key": "deferred",
+        "label": "空闲时预备摘要",
+        "group": "空闲整理与检索",
+        "type": "boolean",
+        "help": "通过原生 maintenance 预备最多两个叶摘要；新输入优先。正式压缩沿用原生阈值与最近原文保留策略。"
+      },
+      {
+        "key": "deferredRatio",
+        "label": "空闲整理触发比例",
+        "group": "空闲整理与检索",
+        "type": "number",
+        "min": 0.1,
+        "max": 0.95,
+        "step": "any",
+        "help": "可填写任意小数。实际预备阈值自动取此值与正式压缩阈值中的较小值。"
+      },
+      {
+        "key": "recall",
+        "label": "启用当前会话检索工具",
+        "group": "空闲整理与检索",
+        "type": "boolean"
+      },
+      {
+        "key": "promptAwareRecall",
+        "label": "压缩后提供检索提示",
+        "group": "空闲整理与检索",
+        "type": "boolean",
+        "help": "提示模型按需检索原文，使用次数与返回长度都受限制。"
+      },
+      {
+        "key": "maxRecallChars",
+        "label": "单次原文返回字符上限",
+        "group": "空闲整理与检索",
+        "type": "number",
+        "min": 1000,
+        "max": 65536
+      },
+      {
+        "key": "maxIndexedChars",
+        "label": "单事件索引字符上限",
+        "group": "空闲整理与检索",
+        "type": "number",
+        "min": 4096,
+        "max": 131072,
+        "help": "索引只存检索词和事件引用；超长原文可用 lcm_expand 分页读取。"
+      },
+      {
+        "key": "rotationMode",
+        "label": "长会话轮转提醒",
+        "group": "长会话健康与交接",
+        "type": "select",
+        "options": [
+          [
+            "notify",
+            "达到阈值时提示（推荐）"
+          ],
+          [
+            "off",
+            "关闭提醒"
+          ]
+        ],
+        "help": "仅检查原生 Session 文件和已观察到的事件数；不自动删除、重置或切换会话。"
+      },
+      {
+        "key": "rotationFileMiB",
+        "label": "历史文件提醒阈值（MiB）",
+        "group": "长会话健康与交接",
+        "type": "number",
+        "min": 1,
+        "max": 2048,
+        "when": {
+          "rotationMode": "notify"
+        },
+        "help": "默认 20 MiB。以原生 .zstd 文件的真实大小为准，不是模型上下文长度。"
+      },
+      {
+        "key": "rotationEventLimit",
+        "label": "会话事件数提醒阈值",
+        "group": "长会话健康与交接",
+        "type": "number",
+        "min": 100,
+        "max": 1000000,
+        "when": {
+          "rotationMode": "notify"
+        },
+        "help": "默认 10000 条；来自原生事件序号和 LCM 已索引游标，停用索引时历史事件数可能滞后。"
+      },
+      {
+        "key": "rotationStatus",
+        "label": "轮转检查状态",
+        "group": "长会话健康与交接",
+        "type": "readonly",
+        "detail": "rotationStatus",
+        "help": "打开或重新聚焦设置页时刷新。跨工作区检查，不读取历史正文。"
+      },
+      {
+        "key": "rotationLargestMiB",
+        "label": "最大的历史文件",
+        "group": "长会话健康与交接",
+        "type": "readonly",
+        "detail": "rotationLargestMiB"
+      },
+      {
+        "key": "rotationLargestEvents",
+        "label": "观察到的最多事件数",
+        "group": "长会话健康与交接",
+        "type": "readonly",
+        "detail": "rotationLargestEvents"
+      },
+      {
+        "key": "rotationHandoff",
+        "label": "轮转交接说明",
+        "group": "长会话健康与交接",
+        "type": "readonly",
+        "detail": "rotationHandoff",
+        "help": "当前版本不支持安全的自动轮转+自动记忆交接：先在 Dream/长期记忆中完成整理并确认保存，再手动 /new 或创建新会话；旧会话保留。"
+      }
+    ]
+  }
+}
