@@ -44,7 +44,7 @@ const configChange=(value,key,next)=>{
   const [head,...tail]=key.split('.');
   return {...value,[head]:tail.length?configChange(value[head],tail.join('.'),next):next};
 };
-function ModelPicker({ scope, kind='chat', provider, model, disabled, label, onChange }) {
+function ModelPicker({ scope, kind='chat', provider, model, disabled, label, emptyLabel, onChange }) {
   const e=React.createElement, [catalog,setCatalog]=React.useState({groups:[]}), [error,setError]=React.useState('');
   React.useEffect(()=>{
     let active=true,sequence=0;
@@ -54,7 +54,7 @@ function ModelPicker({ scope, kind='chat', provider, model, disabled, label, onC
   const encode=(provider,model)=>JSON.stringify([provider,model]),value=encode(provider||'',model||'');
   const known=catalog.groups.some(group=>group.models.some(entry=>group.id===provider&&entry.id===model));
   return e('div',null,e('select',{'aria-label':label,value,disabled,onChange:event=>{const [provider,model]=JSON.parse(event.target.value);onChange({provider,model});}},
-    e('option',{value:encode('','')},kind==='embedding'?'词语检索（不使用向量模型）':'继承 DSH 默认模型'),
+    e('option',{value:encode('','')},emptyLabel || (kind==='embedding'?'词语检索（不使用向量模型）':'继承 DSH 默认模型')),
     provider&&model&&!known?e('option',{value},`${provider} / ${model}（当前配置）`):null,
     catalog.groups.map(group=>e('optgroup',{key:group.id,label:group.name||group.id},group.models.map(entry=>e('option',{key:entry.id,value:encode(group.id,entry.id)},entry.name||entry.id))))),
     error?e('small',{role:'status'},'模型目录暂不可用：'+error):kind==='embedding'&&!catalog.groups.length?e('small',null,'尚未注册向量模型。'):null);
@@ -102,7 +102,7 @@ function FileConfigPage({ scope, title, description, fields, actionLabel, creden
     else if (spec.type === 'multiline') input = e('textarea', {...common,rows:5,value,onChange:event=>change(spec.key,event.target.value)});
     else if (spec.type === 'list') input = e('textarea', {...common, rows: Math.max(3,Math.min(8,value.length+1)), value:editor.listText?.[spec.key]??value.join('\n'),
       onChange:event=>{const text=event.target.value;setEditor(previous=>({...previous,draft:configChange(previous.draft,spec.key,text.split(/[\n,]/).map(item=>item.trim()).filter(Boolean)),listText:{...previous.listText,[spec.key]:text},error:'',errorCode:'',saved:false}));} });
-    else if (spec.type === 'model') input = e(ModelPicker,{scope,kind:spec.kind,provider:configValue(editor.draft,spec.providerKey),model:value,disabled:common.disabled,label:spec.label,onChange:selection=>setEditor(previous=>({...previous,draft:configChange(configChange(previous.draft,spec.providerKey,selection.provider),spec.key,selection.model),error:'',errorCode:'',saved:false}))});
+    else if (spec.type === 'model') input = e(ModelPicker,{scope,kind:spec.kind,provider:configValue(editor.draft,spec.providerKey),model:value,emptyLabel:spec.emptyLabel,disabled:common.disabled,label:spec.label,onChange:selection=>setEditor(previous=>({...previous,draft:configChange(configChange(previous.draft,spec.providerKey,selection.provider),spec.key,selection.model),error:'',errorCode:'',saved:false}))});
     else if (spec.type === 'select') input = e('select', { ...common, value, onChange: event => change(spec.key, spec.numeric ? Number(event.target.value) : event.target.value) }, spec.options.map(([key, label]) => e('option', { key, value: key }, label)));
     else if (spec.type === 'order' || spec.type === 'providers') input = e('ol', { className: 'dpc-order' }, value.map((key, index) => e('li', { key },
       e('span', { className: 'dpc-rank', 'aria-hidden': true }, index + 1), e('span', { className: 'dpc-provider-name' }, spec.labels[key] || key),

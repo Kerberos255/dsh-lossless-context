@@ -97,17 +97,14 @@
         "help": "默认 16384，同时受模型剩余窗口限制；不高于首次上限时不增长。重试调用也会产生模型费用。"
       },
       {
-        "key": "summarizationProvider",
-        "label": "摘要提供方 ID",
+        "key": "summaryModel.model",
+        "providerKey": "summaryModel.provider",
+        "label": "摘要模型",
         "group": "摘要与索引",
-        "type": "text",
-        "help": "与模型 ID 同时填写；均留空时跟随会话模型。"
-      },
-      {
-        "key": "summarizationModel",
-        "label": "摘要模型 ID",
-        "group": "摘要与索引",
-        "type": "text"
+        "type": "model",
+        "kind": "chat",
+        "emptyLabel": "跟随当前会话模型",
+        "help": "未指定时跟随当前会话模型；选择其他模型则用于摘要。"
       },
       {
         "key": "modelPoliciesJson",
@@ -165,74 +162,66 @@
       },
       {
         "key": "rotationMode",
-        "label": "长会话轮转提醒",
-        "group": "长会话健康与交接",
+        "label": "自动轮转",
+        "group": "自动轮转与交接",
         "type": "select",
         "options": [
           [
-            "notify",
-            "达到阈值时提示（推荐）"
+            "auto",
+            "达到阈值后自动交接"
           ],
           [
             "off",
-            "关闭提醒"
+            "关闭自动轮转"
           ]
         ],
-        "help": "仅检查原生 Session 文件和已观察到的事件数；不自动删除、重置或切换会话。"
+        "help": "仅在会话轮次结束且空闲、身份核验及 Dream 归档均成功时创建并切换新会话；失败保留旧会话。"
       },
       {
         "key": "rotationFileMiB",
-        "label": "历史文件提醒阈值（MiB）",
-        "group": "长会话健康与交接",
+        "label": "历史文件轮转阈值（MiB）",
+        "group": "自动轮转与交接",
         "type": "number",
         "min": 1,
         "max": 2048,
         "when": {
-          "rotationMode": "notify"
+          "rotationMode": "auto"
         },
         "help": "默认 20 MiB。以原生 .zstd 文件的真实大小为准，不是模型上下文长度。"
       },
       {
         "key": "rotationEventLimit",
-        "label": "会话事件数提醒阈值",
-        "group": "长会话健康与交接",
+        "label": "会话事件数轮转阈值",
+        "group": "自动轮转与交接",
         "type": "number",
         "min": 100,
         "max": 1000000,
         "when": {
-          "rotationMode": "notify"
+          "rotationMode": "auto"
         },
         "help": "默认 10000 条；来自原生事件序号和 LCM 已索引游标，停用索引时历史事件数可能滞后。"
       },
       {
         "key": "rotationStatus",
-        "label": "轮转检查状态",
-        "group": "长会话健康与交接",
+        "label": "自动轮转运行状态",
+        "group": "自动轮转与交接",
         "type": "readonly",
         "detail": "rotationStatus",
-        "help": "打开或重新聚焦设置页时刷新。跨工作区检查，不读取历史正文。"
+        "help": "只有通过主人身份核验的私聊会话能自动切换；无法完成交接时保留旧历史。"
       },
       {
         "key": "rotationLargestMiB",
         "label": "最大的历史文件",
-        "group": "长会话健康与交接",
+        "group": "自动轮转与交接",
         "type": "readonly",
         "detail": "rotationLargestMiB"
       },
       {
         "key": "rotationLargestEvents",
         "label": "观察到的最多事件数",
-        "group": "长会话健康与交接",
+        "group": "自动轮转与交接",
         "type": "readonly",
         "detail": "rotationLargestEvents"
-      },
-      {
-        "key": "rotationHandoff",
-        "label": "轮转交接说明",
-        "group": "长会话健康与交接",
-        "type": "readonly",
-        "detail": "rotationHandoff",
-        "help": "当前版本不支持安全的自动轮转+自动记忆交接：先在 Dream/长期记忆中完成整理并确认保存，再手动 /new 或创建新会话；旧会话保留。"
       }
     ]
   }

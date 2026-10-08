@@ -11,8 +11,10 @@
   "summaryMaxTokens": 8192,
   "summaryRetryMaxTokens": 32768,
   "summaryRetries": 2,
-  "summarizationProvider": "",
-  "summarizationModel": "",
+  "summaryModel": {
+    "provider": "",
+    "model": ""
+  },
   "modelPoliciesJson": "[]",
   "deferred": true,
   "deferredRatio": 0.7,
@@ -20,7 +22,7 @@
   "promptAwareRecall": true,
   "maxRecallChars": 16000,
   "maxIndexedChars": 32768,
-  "rotationMode": "notify",
+  "rotationMode": "auto",
   "rotationFileMiB": 20,
   "rotationEventLimit": 10000
 }

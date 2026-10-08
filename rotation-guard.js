@@ -2,7 +2,7 @@ import { readdirSync, statSync } from 'node:fs';
 import path from 'node:path';
 
 const MIB=1024*1024;
-/** Read only: never rewrites/removes native sessions or changes active SessionBindings. */
+/** Read-only threshold calculation used by the automatic rotation status page. */
 export function rotationDecision({bytes=0,events=null},config){
   const maxBytes=config.rotationFileMiB*MIB, maxEvents=config.rotationEventLimit;
   const large=bytes>=maxBytes;
@@ -39,9 +39,9 @@ function sessionFiles(home){
 /** Estimates based on compressed file bytes + latest observed native event seq.
  * The persisted cursor can lag when indexing was disabled; the UI says so.
  */
-export function inspectRotation(home,index,config,liveSeq=new Map()){
+export function inspectRotation(home,index,config,liveSeq=new Map(),{reason='',ready=true}={}){
   if(config.rotationMode==='off')return {
-    message:'长会话提醒已关闭；历史仍持续保留，不会自动清理。',
+    message:'自动轮转已关闭；原始会话历史仍保留。',
     rotationStatus:'已关闭',rotationSessionCount:0,rotationExceededCount:0
   };
   const cursors=new Map();
@@ -55,13 +55,12 @@ export function inspectRotation(home,index,config,liveSeq=new Map()){
   const exceeded=rows.filter(row=>row.exceeded);
   const largest=rows.reduce((v,row)=>Math.max(v,row.bytes),0);
   const mostEvents=rows.reduce((v,row)=>Math.max(v,row.events??0),0);
-  const note=exceeded.length
-    ? `有 ${exceeded.length} 个 Session 达到轮转提醒阈值。先完成记忆整理并确认交接，再在 DSH 创建新 Session；旧历史保留。`
-    : '未发现达到阈值的会话。';
+  const note=!ready ? '自动轮转未就绪：'+reason : exceeded.length
+    ? `有 ${exceeded.length} 个历史 Session 达到阈值；仅空闲、主人身份已核验的私聊会话在轮次结束后尝试 Dream 交接与安全切换。`
+    : '自动轮转已启用；未发现达到阈值的会话。';
   return {message:note,rotationStatus:note,
     rotationSessionCount:rows.length,rotationExceededCount:exceeded.length,
     rotationLargestMiB:(largest/MIB).toFixed(2)+' MiB',
-    rotationLargestEvents:mostEvents?String(mostEvents)+'（索引/本次运行记录）':'未获得事件数',
-    rotationHandoff:'当前只提供轮转提醒；不自动重置 Session，也不自动转移记忆。请先执行 Dream/长期记忆整理并确认保存，再手动新建 Session。'
+    rotationLargestEvents:mostEvents?String(mostEvents)+'（索引/本次运行记录）':'未获得事件数'
   };
 }

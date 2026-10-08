@@ -5,9 +5,9 @@ import os from 'node:os';
 import path from 'node:path';
 import { rotationDecision,inspectRotation } from '../rotation-guard.js';
 
-const base={rotationMode:'notify',rotationFileMiB:20,rotationEventLimit:10000};
+const base={rotationMode:'auto',rotationFileMiB:20,rotationEventLimit:10000};
 
-test('warns at either threshold, not before',()=>{
+test('detects either automatic rotation threshold, not before',()=>{
  assert.equal(rotationDecision({bytes:19*1024**2,events:9999},base).exceeded,false);
  assert.equal(rotationDecision({bytes:20*1024**2,events:1000},base).fileExceeded,true);
  assert.equal(rotationDecision({bytes:100,events:10000},base).eventExceeded,true);
@@ -28,8 +28,8 @@ test('reports native files read-only, not session mutation or automatic reset',(
   const result=inspectRotation(home,index,base);
   assert.equal(result.rotationSessionCount,1);
   assert.equal(result.rotationExceededCount,1);
-  assert.match(result.rotationStatus,/记忆整理/);
-  assert.match(result.rotationHandoff,/不自动重置/);
+  assert.match(result.rotationStatus,/自动轮转|历史 Session/);
+  assert.equal(Object.hasOwn(result,'rotationHandoff'),false);
   const off=inspectRotation(home,index,{...base,rotationMode:'off'});
   assert.equal(off.rotationExceededCount,0);
   assert.equal(original.length,256);
