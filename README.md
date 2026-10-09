@@ -1,53 +1,46 @@
-# 无损上下文（LCM）
+# Lossless Context for DeepSeek Harness
 
-为本地 DSH 提供分层摘要、来源 DAG 和当前会话检索。原始记录由 DSH Native Session Log 保存；插件不维护第二份会话历史，不修改官方压缩的提交、回放、取消和持久化规则。
+[简体中文](README.zh-CN.md) · [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) · [Security](SECURITY.md)
 
-## 使用
+A **hierarchical context-compaction and retrieval backend** for DSH. Keep the native session history intact while building traceable summary nodes and allowing agents to retrieve their original supporting text.
 
-在官方客户端“设置 → 插件 → 无损上下文”保存配置。配置文件为安装根目录下的 `plugins/dsh-lossless-context/config.json`。保存后立即应用；已开始的摘要使用开始时的参数，下一次摘要使用新参数。
+## Features
 
-根插件提供设置与索引；`dsh-lossless-context/agent` 是 agent preset 中的压缩后端。安装程序在本地自定义 `agent` preset 中选择此后端，并保留官方 compact 命令及工具结果裁剪。其他 preset 需自行选择后端。
+- Uses the native DSH compaction transaction; the plugin does **not** replace or delete source session logs.
+- Summarizes bounded, tool-call-safe event groups into a layered source DAG.
+- Exposes `lcm_grep`, `lcm_describe`, `lcm_expand`, and `lcm_expand_query` for authorized session-local retrieval.
+- Adapts headroom and output budgets to the **actual selected model**, with bounded retries for truncated summaries.
+- Can prepare reusable summary leaves during idle maintenance without committing compaction.
+- Optionally rotates eligible owner-verified Discord/Feishu direct-message sessions after a verified [Dream & Memory](https://github.com/Kerberos255/dsh-memory-dreaming) handoff.
 
-关闭“使用 LCM”或热停用根插件后，已接入的 agent 继续使用原生 Basic 压缩。关闭“自动压缩”仅停止该后端的自动压力检查；官方手动 compact 仍可使用。配置、启停根服务支持热更新；更换 preset 后端应重新打开客户端或会话。
+## Install and enable
 
-## 压缩与检索
+Requires a compatible DSH host with its native session, token-meter and compaction services. See [package.json](package.json) for peer dependencies.
 
-- 实际路由模型声明的 contextWindow、最大输出、原生 Token Meter 共同决定压力预算。模型未声明窗口时报告错误并保留原文，不猜测窗口。
-- 原生引擎选择工具配对完整的旧上下文，保留最近原文。LCM 将选定输入按叶预算分块，再分层合并摘要；只在原生提交成功后发布 DAG 节点。
-- 「摘要模型」下拉框默认选择「跟随当前会话模型」，也可直接选用 DSH 已配置的模型。配置使用一个 `summaryModel` 对象（包含 provider/model），不再保留旧的独立配置字段；每个叶摘要与合并摘要的实际 usage（供应商有返回时）、估计输出和耗时分别记录；界面显示辅助调用总数。
-- 首次摘要输出预算默认 16384 token。仅当原生返回 `MAX_TOKENS` 时增长预算，默认最多重试 2 次、增长上限 32768 token；同时受摘要模型剩余窗口限制。设置页可关闭重试或调整上限。截断内容始终不提交，取消与其他错误直接返回。
-- 本进程内已完整完成的叶摘要可复用，默认最多 64 条、30 分钟；失败重试无需重新生成相同叶摘要。修改配置会清空缓存。只有原生事务提交后，摘要才成为当前会话检查点。
-- 空闲预备通过原生 maintenance 执行，每次最多生成两个叶摘要，缓存最多 64 条、30 分钟。新输入可取消预备；预备不替换会话、不削减最近原文。正式压缩命中相同输入和策略时复用摘要，命中记录不会重复计算模型费用。
-- `lcm_grep`、`lcm_describe`、`lcm_expand`、`lcm_expand_query` 由当前 agent 的 Native Tools 服务注册，只访问该 agent 当前会话。展开沿原生 sourceEventSeqs 和 DAG 返回原文，支持 offset 分页。
-- 大工具结果复用 DSH 原生 spill 与工具结果裁剪；完整文件定位由原生工具结果提供。插件不增加另一套大文件缓存。
+```sh
+dsh plugin --profile desktop add github:Kerberos255/dsh-lossless-context
+```
 
-## 数据与失败处理
+Then open **Settings → Plugins → Lossless Context**, enable the backend, and choose the `dsh-lossless-context/agent` compaction backend for the agent preset that should use it. Installing the settings plugin alone does not guarantee that every preset uses this backend. Restart when changing plugin code or preset composition.
 
-派生数据库位于 DSH home 的 `lossless-context/index.sqlite`，包含摘要节点、原生事件序号、contentless FTS 检索词和辅助调用元数据，不含完整历史副本。长事件默认只索引头尾共 32768 字符，检索结果标明截断；原文仍可按事件序号分页读取。
+## How it works
 
-索引增量追踪 Native session/event，首次读取旧会话才补齐缺少的事件。索引可由原生日志重建已提交的根摘要与来源关系；删除派生数据库会丢失辅助调用元数据和中间叶摘要。停用插件保留数据。
+```text
+Native session events
+  → native compaction selection
+  → bounded summary leaves → merged summary DAG
+  → native commit (only on success)
+  → searchable index with references to source event IDs
+```
 
-摘要失败、摘要过大、窗口预算不足、取消、输入变化等仍由原生压缩事务处理，原始事件保留。自动压缩失败时原生引擎记录警告并继续原流程；手动 compact 返回原生错误。插件不会伪造摘要或静默删除输入。
+The current session keeps its native record. Retrieval and expansion resolve back to original source events. Model/provider limits and existing policies control thresholds; unavailable model metadata causes a safe error instead of invented budgets.
 
-`modelPoliciesJson` 是精确匹配 provider/model 的 JSON 数组，支持原生阈值、余量、保留策略、摘要模型、输出预算和重试覆盖。`summaryModel` 统一保存 `{ "provider": "", "model": "" }`（跟随会话）或指定提供方/模型组合；运行时转换为 DSH 原生压缩接口所需字段。旧的顶层 `summarizationProvider`、`summarizationModel` 不再接受；`modelPoliciesJson` 的按模型覆盖格式保持不变。
+## Safety, storage, and tests
 
+The plugin stores **derived indexes** under DSH's data directory, not a second complete conversation history. Invalid, cancelled, oversized or truncated summaries are not committed. Private-channel auto-rotation requires verified owner/workspace bindings and completed Dream evidence; ordinary desktop/group/unverified sessions are not silently moved.
 
-## 自动轮转与交接（0.1.15）
+Run `npm test` for portable policy/regression tests. Real compaction and summary quality require an active model and DSH host. Example settings: [config.example.json](config.example.json). Historical notes: [CHANGELOG.md](CHANGELOG.md).
 
-LCM 在原生会话完成轮次后检查阈值（默认 20 MiB 或 10,000 个事件），仅对 **Channel Core 的已核验主人私聊绑定**尝试自动轮转，支持飞书、Discord 共享同一个会话。桌面会话、群聊及未核验身份的渠道会话都不会自动切换。
+Related: [Dream & Memory](https://github.com/Kerberos255/dsh-memory-dreaming) · [Channel Core](https://github.com/Kerberos255/dsh-channel-core).
 
-成功路径是：旧会话保持空闲且事件游标未变化 → Dream 从该会话整理并完成受管事实发布、确认 DREAMS.md 产物的哈希 → 按原有工作区与预设创建确定性新会话 → Channel Core 在 SQLite 单事务内存档旧会话的已核验账号归属、切换同一私聊范围的全部绑定并写审计；日后读取旧来源时会重新核验身份。任一条件不满足，均**保留旧会话、历史、渠道绑定**，不执行自动切换。原始会话日志始终由 DSH 原生管理，不删除或清理。
-
-此机制要求 Dream 已启用、已明确配置记忆主人身份、允许通过核验的候选事实自动发布；两渠道共用私聊时还要求 Channel Core 的共享私聊开启。记忆报告为空、存在待发布/拒绝候选或未提交核验产物时不会切换。设置页「自动轮转运行状态」显示可用性与阈值概况，不再提供只读的手动交接说明。
-
-注意：该自动流程只对**完成轮次之后**产生的触发事件检查。服务停机/未加载期间积累的历史记录不会擅自自动创建新会话，需要新的正常轮次才会评估。
-
-## 自适应压缩余量与空闲预备（0.1.16）
-
-新增 `headroomMode`（`auto` / `fixed`，默认 `auto`）：自动时对每个实际路由模型按 `min(headroomTokens, max(1024, floor(contextWindow × 0.10)))` 计算安全余量，`headroomTokens` 是上限（默认 65536），不是始终固定扣除 65536。按模型策略明确提供的 `headroomTokens` 始终覆盖自动计算；固定模式使用原有数值。模型与预算只依赖原生 Adapter 的模型元数据，元数据缺失继续按原生错误处理，不猜测窗口。
-
-空闲预备改为以**实际原生压缩阈值**计算，并提前最多一个叶分块的预算（受 20% 阈值上限限制）：`min(window×deferredRatio, nativeThreshold−lead)`。正式压缩的已提交 Session 事件和事务不变，仅空闲预备使用原生 maintenance，等待会话空闲且没有待处理输入。设置页显示最近预备状态、触发阈值、成功的叶摘要数、缓存命中数以及失败原因码；失败不强制会话重试或中断正常回复。
-
-插件默认首次输出 16384 token、截断重试 32768 token（最多 2 次），已存在的用户配置不被安装过程覆盖。配置更新将取消待机预备并清空过期叶缓存。分块 8K 继续保持默认；离线对比仅验证分块覆盖与调用次数预测，不能替代真实模型的摘要质量 A/B。
-
-离线可复现基准（480 个**合成**事件，工具调用配对严格保持）：8K 为 11 个叶块、12K 为 7 个叶块、16K 为 6 个叶块；仅验证每个事件恰好保留、工具配对边界与叶调用量，未运行真实模型，不能据此判断信息保留质量、实际延迟或费用。因此默认叶预算仍为 8K，后续需要真实模型 A/B 再决定是否调整。
+MIT licensed. See [LICENSE](LICENSE).
