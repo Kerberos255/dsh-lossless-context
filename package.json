@@ -1,6 +1,6 @@
 {
   "name": "dsh-lossless-context",
-  "version": "0.1.15",
+  "version": "0.1.16",
   "type": "module",
   "description": "使用原生压缩引擎分层整理上下文，保留原始会话并提供检索与展开。",
   "license": "MIT",
@@ -59,6 +59,6 @@
     "node": ">=24"
   },
   "scripts": {
-    "test": "node --test tests/rotation-guard.test.mjs tests/model-picker.test.mjs tests/auto-rotation.test.mjs"
+    "test": "node --test tests/rotation-guard.test.mjs tests/model-picker.test.mjs tests/auto-rotation.test.mjs tests/pressure-budget.test.mjs"
   }
 }

@@ -5,49 +5,67 @@ import { nativeConfig } from './config.js';
 import { leafPlan,summaryBudget,summaryText } from './planner.js';
 import { installRecall } from './recall.js';
 import { summarizeComplete } from './summarizer.js';
+import { warmBudget,scopedNativeConfig } from './pressure.js';
 
 /** Preset-scoped native backend; all surface commits and replay stay native. */
 export default class LosslessCompaction extends BasicCompactionEngine {
  static inject=BasicCompactionEngine.inject;
  constructor(ctx,config={}){
   const settings=ctx.get('losslessContext');super(ctx,settings?nativeConfig(settings.configFile.value):config);
-  this.settings=null;this.pendingConfig=null;this.summaryAborts=new Set();this.idleAbort=null;this.idleAgent=null;this.idleTimer=null;this.idleTask=null;this.warmed=new Map();
+  this.settings=null;this.pendingConfig=null;this.summaryAborts=new Set();this.idleAbort=null;this.idleAgent=null;this.idleTimer=null;this.idleTask=null;this.warmed=new Map();this.warmStats={attempts:0,prepared:0,hits:0,leafRequests:0,leafHits:0,failures:0,cancelled:0,lastState:'未开始',lastError:'',lastAt:0,lastThreshold:0,lastTrigger:0,lastHeadroom:0};
   ctx.inject(['losslessContext'],scope=>{
    const owner=scope.losslessContext;this.settings=owner;owner.engines.add(this);
    const update=()=>{this.warmed.clear();this.idleAbort?.abort();const value=nativeConfig(owner.configFile.value);if(this.summaryAborts.size)this.pendingConfig=value;else this.config=value;};update();
    const unsubscribe=owner.configFile.subscribe(update),recall=installRecall(scope,()=>this.settings?.index,()=>this.settings?.configFile.value);
    scope.effect(()=>()=>{unsubscribe();recall?.dispose?.();owner.engines.delete(this);this.abortSummary();if(this.settings===owner)this.settings=null;});
   });
-  ctx.on('agent/status',({agent,status})=>{if(status!=='idle'||this.idleTimer||this.idleTask||!this.settings?.configFile.value.deferred)return;this.idleTimer=setTimeout(()=>{this.idleTimer=null;const owner=this.settings,task=this.idleMaintenance(agent).catch(()=>{});this.idleTask=task;owner?.tasks.add(task);task.finally(()=>{owner?.tasks.delete(task);if(this.idleTask===task)this.idleTask=null;});},100);this.idleTimer.unref?.();});
+  ctx.on('agent/status',({agent,status})=>{if(status!=='idle'||this.idleTimer||this.idleTask||!this.settings?.configFile.value.deferred)return;this.idleTimer=setTimeout(()=>{this.idleTimer=null;const owner=this.settings,task=this.idleMaintenance(agent).catch(error=>{if(error?.name==='AbortError'||error?.code==='ABORT_ERR'){this.warmStats.cancelled++;this.warmStats.lastState='已取消';return;}this.warmStats.failures++;this.warmStats.lastState='失败';this.warmStats.lastError=String(error?.code||error?.name||'unknown').slice(0,96);});this.idleTask=task;owner?.tasks.add(task);task.finally(()=>{owner?.tasks.delete(task);if(this.idleTask===task)this.idleTask=null;});},100);this.idleTimer.unref?.();});
   ctx.on('agent/inbox/inserted',({agent})=>{if(this.idleAgent?.session.id===agent.session.id)this.idleAbort?.abort();});
   ctx.effect(()=>async()=>{clearTimeout(this.idleTimer);this.abortSummary();await this.idleTask?.catch(()=>{});});
  }
  abortSummary(){for(const abort of this.summaryAborts)abort.abort();this.idleAbort?.abort();}
- compactIfNeeded(agent,trigger,signal){if(this.settings?.configFile.value.enabled&&this.settings.configFile.value.automatic===false)return Promise.resolve(null);return super.compactIfNeeded(agent,trigger,signal);}
+ async compactIfNeeded(agent,trigger,signal){
+  const value=this.settings?.configFile.value;
+  if(value?.enabled&&value.automatic===false)return null;
+  if(trigger!=='pressure'||value?.headroomMode!=='auto')return super.compactIfNeeded(agent,trigger,signal);
+  const target=agent.session.requestHeader()?.config??agent.options;
+  if(!target?.provider||!target?.model)return super.compactIfNeeded(agent,trigger,signal);
+  const info=await this.ctx.llm.resolveModelInfo(target.provider,target.model,signal);
+  if(!info.context?.contextWindow)return super.compactIfNeeded(agent,trigger,signal);
+  const scoped=Object.create(this);
+  scoped.rootEngine=this.rootEngine??this;
+  scoped.config=scopedNativeConfig(this.config,{provider:target.provider,model:target.model,window:info.context.contextWindow,cap:value.headroomTokens,headroomMode:value.headroomMode});
+  return BasicCompactionEngine.prototype.compactIfNeeded.call(scoped,agent,trigger,signal);
+ }
  async idleMaintenance(agent){
   const settings=this.settings,value=settings?.configFile.value;if(!settings?.index||!value.enabled||!value.automatic||!value.deferred||this.idleAbort||agent.status!=='idle'||agent.inbox.hasPending)return;
-  const measurement=this.ctx.tokenMeter.measure(agent.session);if(measurement.totalTokens<Math.max(value.headroomTokens,4096))return;
+  const measurement=this.ctx.tokenMeter.measure(agent.session);if(measurement.totalTokens<4096)return;
   const config=agent.session.requestHeader()?.config;if(!config)return;
   const abort=new AbortController();this.idleAbort=abort;this.idleAgent=agent;
   try{await agent.runMaintenance(async nativeSignal=>{
    const signal=AbortSignal.any([nativeSignal,abort.signal]),info=await this.ctx.llm.resolveModelInfo(config.provider,config.model,signal);if(!info.context)return;
    const override=this.config.modelPolicies.find(policy=>policy.provider===config.provider&&policy.model===config.model)??{};
-   const window=info.context.contextWindow,output=config.maxTokens??info.defaultMaxTokens??0,threshold=Math.min(window*Math.min(value.deferredRatio,override.thresholdRatio??this.config.thresholdRatio),window-output-(override.headroomTokens??this.config.headroomTokens));
-   if(threshold<=0||measurement.totalTokens<threshold)return;
+   const window=info.context.contextWindow,output=config.maxTokens??info.defaultMaxTokens??0;
+   const budget=warmBudget({window,output,thresholdRatio:this.config.thresholdRatio,headroomTokens:value.headroomTokens,headroomMode:value.headroomMode,override,deferredRatio:value.deferredRatio,leafChunkTokens:value.leafChunkTokens});
+   this.warmStats.lastThreshold=budget.threshold;this.warmStats.lastTrigger=budget.trigger;this.warmStats.lastHeadroom=budget.safety;
+   if(budget.threshold<=0||budget.trigger<=0){this.warmStats.lastState='模型窗口余量不足';return;}
+   if(measurement.totalTokens<budget.trigger){this.warmStats.lastState='等待提前预备';return;}
+   this.warmStats.attempts++;this.warmStats.lastAt=Date.now();this.warmStats.lastState='正在预备';this.warmStats.lastError='';
    const retain=override.retainTokens??(override.retainRatio!==undefined?Math.floor((window-output)*override.retainRatio):(this.config.retainTokens??Math.floor((window-output)*this.config.retainRatio)));
    const nodes=agent.session.surface.nodes,first=agent.session.deriveEventMessage(agent.session.eventAt(nodes[0]))?.role==='system'?1:0;let from=nodes.length,kept=0;
    for(let i=nodes.length-1;i>=first;i--){from=i;kept+=measurement.nodes[i].tokens;if(kept>=retain)break;}
    while(from>first&&(!toolPairingBalancedBefore(agent.session,nodes[from])||!toolPairingBalancedAfter(agent.session,nodes[from-1])))from--;
-   if(from<=first)return;
+   if(from<=first){this.warmStats.lastState='旧上下文不足以预备';return;}
    const system=first?agent.session.deriveEventMessage(agent.session.eventAt(nodes[0])):null,input={tools:agent.session.requestHeader()?.tools,messages:[...(system?[system]:[]),...nodes.slice(first,from).map(seq=>agent.session.deriveEventMessage(agent.session.eventAt(seq))).filter(Boolean)]};
    const {plan}=await this.prepare(input,agent,signal,value),warmId='warm:'+randomUUID();let count=0,ordinal=0;
-   for(const group of plan.groups){if(count>=2)break;const payload=plan.groups.length===1?input:{...input,messages:[...(plan.system?[plan.system]:[]),...group.messages]},key=this.cacheKey(payload,agent);if(this.cached(key))continue;
+   for(const group of plan.groups){if(count>=2)break;const payload=plan.groups.length===1?input:{...input,messages:[...(plan.system?[plan.system]:[]),...group.messages]},key=this.cacheKey(payload,agent);if(this.cached(key)){this.warmStats.hits++;continue;}
     signal.throwIfAborted();const started=performance.now(),result=await this.completeSummary(payload,agent,signal,value,metadata=>settings.index.auxiliary(agent.session.id,warmId,ordinal++,'truncated',metadata));signal.throwIfAborted();
     settings.index.auxiliary(agent.session.id,warmId,ordinal++,'warm-leaf',{provider:result.provider,model:result.model,maxTokens:result.maxTokens,usage:result.usage??null,durationMs:Math.round(performance.now()-started),estimatedOutputTokens:this.ctx.tokenMeter.estimateMessage({role:'assistant',content:result.summary})});count++;this.remember(key,result,warmId);
    }
+   this.warmStats.prepared+=count;this.warmStats.lastState=count?'已预备 '+count+' 个叶摘要':'缓存已命中或没有可预备片段';
   });}finally{if(this.idleAbort===abort){this.idleAbort=null;this.idleAgent=null;}}
  }
- cacheKey(input,agent){return createHash('sha256').update(JSON.stringify([agent.session.id,agent.session.requestHeader()?.config??agent.options,this.config,input])).digest('hex');}
+ cacheKey(input,agent){return createHash('sha256').update(JSON.stringify([agent.session.id,agent.session.requestHeader()?.config??agent.options,{...this.config,headroomTokens:0},input])).digest('hex');}
  cached(key){const row=this.warmed.get(key);if(!row)return null;if(Date.now()-row.at>1800000){this.warmed.delete(key);return null;}return row;}
  remember(key,result,source){this.warmed.set(key,{result,source,at:Date.now()});while(this.warmed.size>64)this.warmed.delete(this.warmed.keys().next().value);}
  completeSummary(input,agent,signal,value,onTruncated){return summarizeComplete(BasicCompactionEngine.prototype.summarize,this.ctx,this.config,input,agent,signal,{...value,onTruncated});}
@@ -57,7 +75,7 @@ export default class LosslessCompaction extends BasicCompactionEngine {
   const abort=new AbortController();this.summaryAborts.add(abort);const combined=signal?AbortSignal.any([signal,abort.signal]):abort.signal;
   const operation=this.summarizeLossless(input,agent,combined,settings,value);
   settings.tasks.add(operation);
-  return operation.finally(()=>{settings.tasks.delete(operation);this.summaryAborts.delete(abort);if(this.pendingConfig&&!this.summaryAborts.size){this.config=this.pendingConfig;this.pendingConfig=null;}});
+  return operation.finally(()=>{const owner=this.rootEngine??this;settings.tasks.delete(operation);owner.summaryAborts.delete(abort);if(owner.pendingConfig&&!owner.summaryAborts.size){owner.config=owner.pendingConfig;owner.pendingConfig=null;}});
  }
  async prepare(input,agent,signal,value){
   const routed=agent.session.requestHeader()?.config??agent.options,override=this.config.modelPolicies.find(policy=>policy.provider===routed.provider&&policy.model===routed.model)??{};
@@ -65,7 +83,10 @@ export default class LosslessCompaction extends BasicCompactionEngine {
   const info=await this.ctx.llm.resolveModelInfo(provider,model,signal),system=input.messages[0]?.role==='system'?input.messages[0]:null;
   const overhead=(system?this.ctx.tokenMeter.estimateMessage(system):0)+Math.ceil(JSON.stringify(input.tools??[]).length/3)+2000;
   const initial=override.maxTokens??this.config.maxTokens,window=info.context?.contextWindow;
-  const reserve=value.summaryRetries?Math.max(initial,Math.min(value.summaryRetryMaxTokens,Math.floor(window/4))):initial;
+  const requested=value.summaryRetries?Math.max(initial,Math.min(value.summaryRetryMaxTokens,Math.floor(window/4))):initial;
+  const afterOverhead=window-overhead-Math.min(4096,Math.ceil(window*0.1));
+  const reserve=Math.floor(Math.min(requested,info.context?.maxOutputTokens??Infinity,afterOverhead/2));
+  if(reserve<128)throw new Error('lcm-summary-model-budget-too-small');
   const {available}=summaryBudget(info,reserve,overhead);
   const plan=leafPlan(input,this.ctx.tokenMeter,Math.min(value.leafChunkTokens,available));
   if(plan.groups.length>256||plan.groups.some(group=>group.tokens>available))throw new Error('lcm-leaf-exceeds-summary-model-budget');
@@ -77,7 +98,7 @@ export default class LosslessCompaction extends BasicCompactionEngine {
   const leaves=[];let ordinal=0;
   const run=async(payload,kind)=>{
    signal.throwIfAborted();const started=performance.now(),key=kind==='leaf'?this.cacheKey(payload,agent):null,cached=key?this.cached(key):null,result=cached?{...cached.result,usage:undefined,rawOutput:undefined,llmStreamCall:false}:await this.completeSummary(payload,agent,signal,value,metadata=>index.auxiliary(agent.session.id,compactionId,ordinal++,'truncated',metadata));
-   signal.throwIfAborted();index.auxiliary(agent.session.id,compactionId,ordinal++,kind,{provider:result.provider,model:result.model,maxTokens:result.maxTokens,usage:result.usage??null,cachedFrom:cached?.source??null,estimatedOutputTokens:this.ctx.tokenMeter.estimateMessage({role:'assistant',content:result.summary}),durationMs:Math.round(performance.now()-started)});if(key&&!cached)this.remember(key,result,compactionId);return result;
+   signal.throwIfAborted();if(kind==='leaf'){this.warmStats.leafRequests++;if(cached)this.warmStats.leafHits++;}if(cached)this.warmStats.hits++;index.auxiliary(agent.session.id,compactionId,ordinal++,kind,{provider:result.provider,model:result.model,maxTokens:result.maxTokens,usage:result.usage??null,cachedFrom:cached?.source??null,estimatedOutputTokens:this.ctx.tokenMeter.estimateMessage({role:'assistant',content:result.summary}),durationMs:Math.round(performance.now()-started)});if(key&&!cached)this.remember(key,result,compactionId);return result;
   };
   if(plan.groups.length===1){const result=await run(input,'leaf');index.plan(agent.session.id,compactionId,{leaves:[{start:0,end:plan.groups[0].end,summary:summaryText(result)}]});return this.withRecallHint(result,value);}
   for(const group of plan.groups){const result=await run({...input,messages:[...(plan.system?[plan.system]:[]),...group.messages]},'leaf');leaves.push({...group,messages:undefined,summary:summaryText(result),result});}
