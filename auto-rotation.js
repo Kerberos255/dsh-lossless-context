@@ -73,8 +73,8 @@ export function installAutoRotation(ctx,configFile,enabled=()=>true){
    if(!core?.store?.db?.prepare('SELECT 1 FROM bindings WHERE session_id=? LIMIT 1').get(session.id))return;
    if(!dream?.configFile?.value?.ownerIdentityId||!core.trustedMemorySession?.(session.id,dream.configFile.value.ownerIdentityId))return;
    if(!rotationInput(ctx.dshHomePath(),session.id,seq,conf).exceeded)return;
-   try{await rotateWithVerifiedMemory({ctx,session,expectedSeq:seq,settings:conf,signal:abort.signal});errors.delete(session.id);}
-   catch(error){if(!abort.signal.aborted){errors.set(session.id,error.message);if(errors.size>100)errors.delete(errors.keys().next().value);}}
+   try{await rotateWithVerifiedMemory({ctx,session,expectedSeq:seq,settings:conf,signal:abort.signal});errors.delete(session.id);ctx.get('pluginDiagnostics')?.record('dsh-lossless-context','info','rotation.completed',{state:'completed'});}
+   catch(error){if(!abort.signal.aborted){ctx.get('pluginDiagnostics')?.record('dsh-lossless-context','error','rotation.failed',{code:error?.code,state:'failed'});errors.set(session.id,error.message);if(errors.size>100)errors.delete(errors.keys().next().value);}}
   })().finally(()=>inflight.delete(session.id));
   inflight.add(session.id);
   promise.catch(()=>{});

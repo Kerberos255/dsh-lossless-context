@@ -5,6 +5,7 @@ import { inspectRotation } from './rotation-guard.js';
 import { installAutoRotation } from './auto-rotation.js';
 export const inject=['dshHomePath'];
 export function apply(ctx,legacy={}){
+  ctx.inject(['pluginDiagnostics'],scope=>{const diag=scope.get('pluginDiagnostics');diag.start('dsh-lossless-context');scope.effect(()=>()=>diag.stop('dsh-lossless-context'));});
  let index=null,error='',settings,autoRotation;
  const engines=new Set(),liveSeq=new Map();
  settings=new PluginConfig(ctx,{service:'losslessContext',packageName:'dsh-lossless-context',schema,details:()=>{
@@ -33,7 +34,7 @@ export function apply(ctx,legacy={}){
   return {enabled,available:!!index&&!error,indexedEvents:total('lcm_refs'),nodes:total('lcm_nodes'),auxiliaryCalls:total('lcm_aux_calls'),activeCompactions:index?.db.prepare("SELECT COUNT(*) AS count FROM lcm_compactions WHERE state='running'"+(sessionId?' AND session_id=?':'')).get(...args).count??null,thresholdRatio:settings.configFile.value.thresholdRatio};
  };
  try{index=new LosslessIndex(ctx.dshHomePath('lossless-context','index.sqlite'),settings.configFile.value);settings.index=index;}
- catch{error='索引暂不可用，继续使用原生压缩；请检查插件数据目录。';}
+ catch{error='索引暂不可用，继续使用原生压缩；请检查插件数据目录。';ctx.get('pluginDiagnostics')?.record('dsh-lossless-context','error','index.unavailable',{state:'failed'});}
  settings.configFile.subscribe(snapshot=>{if(index)index.maxIndexedChars=snapshot.value.maxIndexedChars;});
  ctx.on('session/event',(session,event)=>{
   // Track counts independently of index availability; never force Session changes.
