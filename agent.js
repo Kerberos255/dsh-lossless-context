@@ -61,7 +61,7 @@ export default class LosslessCompaction extends BasicCompactionEngine {
    const system=first?agent.session.deriveEventMessage(agent.session.eventAt(nodes[0])):null,input={tools:agent.session.requestHeader()?.tools,messages:[...(system?[system]:[]),...nodes.slice(first,from).map(seq=>agent.session.deriveEventMessage(agent.session.eventAt(seq))).filter(Boolean)]};
    const {plan}=await this.prepare(input,agent,signal,value),warmId='warm:'+randomUUID();let count=0,ordinal=0;
    for(const group of plan.groups){if(count>=2)break;const payload=plan.groups.length===1?input:{...input,messages:[...(plan.system?[plan.system]:[]),...group.messages]},key=this.cacheKey(payload,agent);if(this.cached(key)){this.warmStats.hits++;continue;}
-    signal.throwIfAborted();const started=performance.now(),result=await this.completeSummary(payload,agent,signal,value,metadata=>settings.index.auxiliary(agent.session.id,warmId,ordinal++,'truncated',metadata));signal.throwIfAborted();
+    signal.throwIfAborted();const started=performance.now(),result=await this.completeSummary(payload,agent,signal,value,metadata=>settings.index.auxiliary(agent.session.id,warmId,ordinal++,'truncated',metadata),'leaf');signal.throwIfAborted();
     settings.index.auxiliary(agent.session.id,warmId,ordinal++,'warm-leaf',{provider:result.provider,model:result.model,maxTokens:result.maxTokens,usage:result.usage??null,durationMs:Math.round(performance.now()-started),estimatedOutputTokens:this.ctx.tokenMeter.estimateMessage({role:'assistant',content:result.summary})});count++;this.remember(key,result,warmId);
    }
    this.warmStats.prepared+=count;this.warmStats.lastState=count?'已预备 '+count+' 个叶摘要':'缓存已命中或没有可预备片段';
@@ -70,7 +70,7 @@ export default class LosslessCompaction extends BasicCompactionEngine {
  cacheKey(input,agent){return createHash('sha256').update(JSON.stringify([agent.session.id,agent.session.requestHeader()?.config??agent.options,{...this.config,headroomTokens:0},input])).digest('hex');}
  cached(key){const row=this.warmed.get(key);if(!row)return null;if(Date.now()-row.at>1800000){this.warmed.delete(key);return null;}return row;}
  remember(key,result,source){this.warmed.set(key,{result,source,at:Date.now()});while(this.warmed.size>64)this.warmed.delete(this.warmed.keys().next().value);}
- completeSummary(input,agent,signal,value,onTruncated){return summarizeComplete(BasicCompactionEngine.prototype.summarize,this.ctx,this.config,input,agent,signal,{...value,compressionTimeoutMs:value.compressionTimeoutMs,compressionMaxRetries:value.compressionMaxRetries,onTruncated,onTimeout:info=>this.ctx.get('pluginDiagnostics')?.record('dsh-lossless-context','warn','compression.timeout',info)});}
+ completeSummary(input,agent,signal,value,onTruncated,kind){return summarizeComplete(BasicCompactionEngine.prototype.summarize,this.ctx,this.config,input,agent,signal,{...value,kind:kind??'leaf',compressionTimeoutMs:value.compressionTimeoutMs,compressionMaxRetries:value.compressionMaxRetries,onTruncated,onTimeout:info=>this.ctx.get('pluginDiagnostics')?.record('dsh-lossless-context','warn','compression.timeout',info)});}
  summarize(input,agent,signal){
   const settings=this.settings,value=settings?.configFile.value;
   if(!settings?.index||!value.enabled)return super.summarize(input,agent,signal);
@@ -103,7 +103,7 @@ export default class LosslessCompaction extends BasicCompactionEngine {
   const leaves=[];let ordinal=0;
   const run=async(payload,kind)=>{
    signal.throwIfAborted();const started=performance.now(),key=kind==='leaf'?this.cacheKey(payload,agent):null,cached=key?this.cached(key):null;let result;
-   try{result=cached?{...cached.result,usage:undefined,rawOutput:undefined,llmStreamCall:false}:await this.completeSummary(payload,agent,signal,value,metadata=>index.auxiliary(agent.session.id,compactionId,ordinal++,'truncated',metadata));}
+   try{result=cached?{...cached.result,usage:undefined,rawOutput:undefined,llmStreamCall:false}:await this.completeSummary(payload,agent,signal,value,metadata=>index.auxiliary(agent.session.id,compactionId,ordinal++,'truncated',metadata),kind);}
    catch(error){this.diagnostics('compression.failed','error',{stage:kind,code:error?.code||error?.name,error:String(error?.message||error)});throw error;}
    signal.throwIfAborted();if(kind==='leaf'){this.warmStats.leafRequests++;if(cached)this.warmStats.leafHits++;}if(cached)this.warmStats.hits++;index.auxiliary(agent.session.id,compactionId,ordinal++,kind,{provider:result.provider,model:result.model,maxTokens:result.maxTokens,usage:result.usage??null,cachedFrom:cached?.source??null,estimatedOutputTokens:this.ctx.tokenMeter.estimateMessage({role:'assistant',content:result.summary}),durationMs:Math.round(performance.now()-started)});if(key&&!cached)this.remember(key,result,compactionId);return result;
   };

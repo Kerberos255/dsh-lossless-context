@@ -1,6 +1,7 @@
 {
   "name": "dsh-lossless-context",
-  "version": "0.1.20",
+  "version": "0.1.21",
+  "private": true,
   "type": "module",
   "description": "使用原生压缩引擎分层整理上下文，保留原始会话并提供检索与展开。",
   "license": "MIT",
@@ -21,9 +22,6 @@
     "locale/",
     "cordis.patch.yml",
     "README.md",
-    "README.zh-CN.md",
-    "SECURITY.md",
-    "CHANGELOG.md",
     "config.example.json",
     "config.js",
     "client.js"
@@ -53,15 +51,5 @@
     "@deepseek-ai/dsh-client-connection": "0.2.0-rc.2 || 0.2.1-alpha.1",
     "@deepseek-ai/dsh-client-ui-plugin-manager": "0.2.0-rc.2 || 0.2.1-alpha.1",
     "@deepseek-ai/dsh-client-ui-primitives": "0.2.0-rc.2 || 0.2.1-alpha.1"
-  },
-  "keywords": [
-    "dsh-plugin",
-    "deepseek-harness"
-  ],
-  "engines": {
-    "node": ">=24"
-  },
-  "scripts": {
-    "test": "node --test tests/rotation-guard.test.mjs tests/model-picker.test.mjs tests/auto-rotation.test.mjs tests/pressure-budget.test.mjs"
   }
 }

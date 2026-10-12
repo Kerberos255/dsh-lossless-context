@@ -12,6 +12,8 @@ export async function summarizeComplete(nativeSummarize, ctx, native, input, age
  if(Number.isSafeInteger(info.context?.maxOutputTokens))limits.push(info.context.maxOutputTokens);
  const ceiling=Math.floor(Math.min(...limits));
  if(ceiling<128)throw Object.assign(new Error('剩余模型窗口不足以生成完整摘要，请缩小待压缩片段'),{code:'SUMMARY_BUDGET'});
+ const target=options.kind==='condensed'?options.condensedTargetTokens:options.leafTargetTokens;
+ const summarizationInput=Number.isSafeInteger(target)&&target>0?{...input,messages:[...input.messages,{role:'user',content:[{type:'text',text:'Target length: about '+target+' tokens or less.'}]}]}:input;
  for(let attempt=0,maxTokens=Math.min(config.maxTokens,ceiling);;attempt++){
   signal?.throwIfAborted();let usage,finish;
   const llm={stream:async function*(request){for await(const chunk of ctx.llm.stream(request)){if(chunk.type==='usage')usage=chunk.usage;if(chunk.type==='finish')finish=chunk.reason?.kind;yield chunk;}}};
@@ -19,7 +21,7 @@ export async function summarizeComplete(nativeSummarize, ctx, native, input, age
    const timeout=options.compressionTimeoutMs??0;
    const timeoutSignal=timeout>0&&AbortSignal.timeout?AbortSignal.timeout(timeout):null;
    const runSignal=timeoutSignal&&signal?AbortSignal.any([signal,timeoutSignal]):(timeoutSignal||signal);
-   const result=await nativeSummarize.call({ctx:{llm},config:{...config,maxTokens}},input,agent,runSignal);
+   const result=await nativeSummarize.call({ctx:{llm},config:{...config,maxTokens}},summarizationInput,agent,runSignal);
    if(timeoutSignal?.aborted)throw Object.assign(new Error('lcm-compression-timeout'),{code:'LCM_TIMEOUT'});
    runSignal?.throwIfAborted();return result;
   }catch(error){
