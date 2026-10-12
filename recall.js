@@ -15,11 +15,11 @@ export function recall(index,session,kind,args,{maxRecallChars=16000}={}){
   return {id:node.id,kind:node.kind,depth:node.depth,children:node.children,sourceSeqs:node.sourceSeqs,summary:node.summary??eventText(session.eventAt(node.summary_seq))};
  }
  let seqs;
- if(kind==='grep'||kind==='expand-query'){
+ if(kind==='grep'){
   if(typeof args.query!=='string'||!args.query.trim()||args.query.length>1000)throw new Error('lcm-query-invalid');
   const matches=index.search(session.id,args.query,limit);
-  if(kind==='grep')return {matches:matches.map(match=>({...match,excerpt:eventText(session.eventAt(match.seq)).slice(0,240)}))};seqs=matches.map(match=>match.seq);
- }else if(args.id)seqs=index.sources(session.id,args.id);
+  return {matches:matches.map(match=>({...match,excerpt:eventText(session.eventAt(match.seq)).slice(0,240)}))}
+ }else if(typeof args.query==='string'&&args.query.trim()){if(args.query.length>1000)throw new Error('lcm-query-invalid');seqs=index.search(session.id,args.query,limit).map(match=>match.seq);}else if(args.id)seqs=index.sources(session.id,args.id);
  else if(Number.isSafeInteger(args.seq)&&args.seq>=0)seqs=[args.seq];
  else throw new Error('lcm-source-required');
  seqs=nativeSources(session,seqs);
@@ -29,7 +29,7 @@ export function recall(index,session,kind,args,{maxRecallChars=16000}={}){
 }
 export function installRecall(ctx,getIndex,getConfig){
  return ctx.inject(['tools'],scope=>{
-  for(const [name,kind,description]of [['lcm_grep','grep','在当前会话原文中检索词语，支持中文；返回事件序号和简短片段。'],['lcm_describe','describe','查看当前会话摘要 DAG 节点及来源。'],['lcm_expand','expand','按事件序号或摘要节点展开当前会话原文；按 offset 分页读取。'],['lcm_expand_query','expand-query','按检索词展开当前会话匹配原文，返回长度受配置限制。']])scope.tools.register({name,description,
+  for(const [name,kind,description]of [['lcm_grep','grep','在当前会话原文中检索词语，支持中文；返回事件序号和简短片段。'],['lcm_describe','describe','查看当前会话摘要 DAG 节点及来源。'],['lcm_expand','expand','按事件序号、摘要节点或检索词展开当前会话原文；按 offset 分页读取，返回长度受配置限制。']])scope.tools.register({name,description,
    parameters:{type:'object',properties:{query:{type:'string'},id:{type:'string'},seq:{type:'integer',minimum:0},limit:{type:'integer',minimum:1,maximum:50},offset:{type:'integer',minimum:0}},additionalProperties:false},
    output:{schema:{type:'object',additionalProperties:true},render:(_args,value)=>[{type:'text',text:JSON.stringify(value)}]},
    async execute(args,exec){exec.signal.throwIfAborted();const index=getIndex(),config=getConfig();if(!index||!config?.enabled||!config.recall||!exec.agent)throw new Error('lcm-recall-unavailable');return recall(index,exec.agent.session,kind,args,config);},
