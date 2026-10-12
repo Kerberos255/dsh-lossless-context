@@ -24,6 +24,8 @@ export default class LosslessCompaction extends BasicCompactionEngine {
   ctx.effect(()=>async()=>{clearTimeout(this.idleTimer);this.abortSummary();await this.idleTask?.catch(()=>{});});
  }
  abortSummary(){for(const abort of this.summaryAborts)abort.abort();this.idleAbort?.abort();}
+ diagnostics(event,level='info',data={}){this.ctx.get('pluginDiagnostics')?.record('dsh-lossless-context',level,event,data);}
+
  async compactIfNeeded(agent,trigger,signal){
   const value=this.settings?.configFile.value;
   if(value?.enabled&&value.automatic===false)return null;
@@ -94,10 +96,15 @@ export default class LosslessCompaction extends BasicCompactionEngine {
  }
  async summarizeLossless(input,agent,signal,settings,value){
   const index=settings.index;index.sync(agent.session);const compactionId=index.active(agent.session.id);if(!compactionId)throw new Error('lcm-native-compaction-marker-missing');
-  const {plan,available}=await this.prepare(input,agent,signal,value);
+  this.diagnostics('compression.started','info',{sessionId:agent.session.id,provider:agent.session.requestHeader()?.config?.provider,model:agent.session.requestHeader()?.config?.model});
+  let plan,available;
+  try{({plan,available}=await this.prepare(input,agent,signal,value));}
+  catch(error){this.diagnostics('compression.failed','error',{stage:'prepare',code:error?.code||error?.name,error:String(error?.message||error)});throw error;}
   const leaves=[];let ordinal=0;
   const run=async(payload,kind)=>{
-   signal.throwIfAborted();const started=performance.now(),key=kind==='leaf'?this.cacheKey(payload,agent):null,cached=key?this.cached(key):null,result=cached?{...cached.result,usage:undefined,rawOutput:undefined,llmStreamCall:false}:await this.completeSummary(payload,agent,signal,value,metadata=>index.auxiliary(agent.session.id,compactionId,ordinal++,'truncated',metadata));
+   signal.throwIfAborted();const started=performance.now(),key=kind==='leaf'?this.cacheKey(payload,agent):null,cached=key?this.cached(key):null;let result;
+   try{result=cached?{...cached.result,usage:undefined,rawOutput:undefined,llmStreamCall:false}:await this.completeSummary(payload,agent,signal,value,metadata=>index.auxiliary(agent.session.id,compactionId,ordinal++,'truncated',metadata));}
+   catch(error){this.diagnostics('compression.failed','error',{stage:kind,code:error?.code||error?.name,error:String(error?.message||error)});throw error;}
    signal.throwIfAborted();if(kind==='leaf'){this.warmStats.leafRequests++;if(cached)this.warmStats.leafHits++;}if(cached)this.warmStats.hits++;index.auxiliary(agent.session.id,compactionId,ordinal++,kind,{provider:result.provider,model:result.model,maxTokens:result.maxTokens,usage:result.usage??null,cachedFrom:cached?.source??null,estimatedOutputTokens:this.ctx.tokenMeter.estimateMessage({role:'assistant',content:result.summary}),durationMs:Math.round(performance.now()-started)});if(key&&!cached)this.remember(key,result,compactionId);return result;
   };
   if(plan.groups.length===1){const result=await run(input,'leaf');index.plan(agent.session.id,compactionId,{leaves:[{start:0,end:plan.groups[0].end,summary:summaryText(result)}]});return this.withRecallHint(result,value);}
@@ -113,6 +120,7 @@ export default class LosslessCompaction extends BasicCompactionEngine {
    }if(next.length>=layer.length)throw new Error('lcm-condensed-summary-does-not-fit');layer=next;
   }
   const root=dag.branches.pop();dag.rootChildren=root.children;index.plan(agent.session.id,compactionId,dag);
+  this.diagnostics('compression.completed','info',{sessionId:agent.session.id});
   const result=layer[0].result;
   return this.withRecallHint(result,value);
  }
