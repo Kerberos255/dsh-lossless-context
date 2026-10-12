@@ -16,10 +16,19 @@ export async function summarizeComplete(nativeSummarize, ctx, native, input, age
   signal?.throwIfAborted();let usage,finish;
   const llm={stream:async function*(request){for await(const chunk of ctx.llm.stream(request)){if(chunk.type==='usage')usage=chunk.usage;if(chunk.type==='finish')finish=chunk.reason?.kind;yield chunk;}}};
   try{
-   const result=await nativeSummarize.call({ctx:{llm},config:{...config,maxTokens}},input,agent,signal);
-   signal?.throwIfAborted();return result;
+   const timeout=options.compressionTimeoutMs??0;
+   const timeoutSignal=timeout>0&&AbortSignal.timeout?AbortSignal.timeout(timeout):null;
+   const runSignal=timeoutSignal&&signal?AbortSignal.any([signal,timeoutSignal]):(timeoutSignal||signal);
+   const result=await nativeSummarize.call({ctx:{llm},config:{...config,maxTokens}},input,agent,runSignal);
+   if(timeoutSignal?.aborted)throw Object.assign(new Error('lcm-compression-timeout'),{code:'LCM_TIMEOUT'});
+   runSignal?.throwIfAborted();return result;
   }catch(error){
    signal?.throwIfAborted();
+   if(error.code==='LCM_TIMEOUT'){
+    options.onTimeout?.({provider,model,timeoutMs:options.compressionTimeoutMs,attempt:attempt+1});
+    if(attempt>=options.compressionMaxRetries)throw error;
+    continue;
+   }
    if(error.code!=='MAX_TOKENS')throw error;
    options.onTruncated?.({provider,model,maxTokens,attempt:attempt+1,finish,usage:usage??null});
    const next=Math.min(ceiling,maxTokens*2);

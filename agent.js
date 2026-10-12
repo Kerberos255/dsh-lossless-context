@@ -68,7 +68,7 @@ export default class LosslessCompaction extends BasicCompactionEngine {
  cacheKey(input,agent){return createHash('sha256').update(JSON.stringify([agent.session.id,agent.session.requestHeader()?.config??agent.options,{...this.config,headroomTokens:0},input])).digest('hex');}
  cached(key){const row=this.warmed.get(key);if(!row)return null;if(Date.now()-row.at>1800000){this.warmed.delete(key);return null;}return row;}
  remember(key,result,source){this.warmed.set(key,{result,source,at:Date.now()});while(this.warmed.size>64)this.warmed.delete(this.warmed.keys().next().value);}
- completeSummary(input,agent,signal,value,onTruncated){return summarizeComplete(BasicCompactionEngine.prototype.summarize,this.ctx,this.config,input,agent,signal,{...value,onTruncated});}
+ completeSummary(input,agent,signal,value,onTruncated){return summarizeComplete(BasicCompactionEngine.prototype.summarize,this.ctx,this.config,input,agent,signal,{...value,compressionTimeoutMs:value.compressionTimeoutMs,compressionMaxRetries:value.compressionMaxRetries,onTruncated,onTimeout:info=>this.ctx.get('pluginDiagnostics')?.record('dsh-lossless-context','warn','compression.timeout',info)});}
  summarize(input,agent,signal){
   const settings=this.settings,value=settings?.configFile.value;
   if(!settings?.index||!value.enabled)return super.summarize(input,agent,signal);
