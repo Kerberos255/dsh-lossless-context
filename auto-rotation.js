@@ -63,6 +63,25 @@ export async function rotateWithVerifiedMemory({ctx,session,expectedSeq,settings
 
 export function installAutoRotation(ctx,configFile,enabled=()=>true){
  const inflight=new Set(),errors=new Map(),lastEnd=new Map(),abort=new AbortController();
+ const stateFile=path.join(ctx.dshHomePath(),'lossless-context','rotation-backoff.json');
+ let cooldown={};
+ try {const data=JSON.parse(fs.readFileSync(stateFile,'utf8'));if(data&&typeof data==='object'&&!Array.isArray(data))cooldown=data;}catch {}
+ const save=()=>{
+  try {
+   fs.mkdirSync(path.dirname(stateFile),{recursive:true});
+   const temp=stateFile+'.'+process.pid+'.tmp';
+   fs.writeFileSync(temp,JSON.stringify(cooldown),'utf8');
+   fs.renameSync(temp,stateFile);
+  }catch(error){ctx.get?.('pluginDiagnostics')?.record('dsh-lossless-context','warn','rotation.backoff-save-failed',{code:error?.code||'unknown'});}
+ };
+ const classify=error=>{
+  const msg=String(error?.message||'');
+  if(/缺少可验证|未就绪|主人身份|自动发布|预设不一致|工作区不匹配|会话与 Dream|仅主人身份|原生会话查询不可用/.test(msg))return 'configuration';
+  if(/未空闲|待处理消息|发生了变化|又收到事件/.test(msg))return 'busy';
+  return 'transient';
+ };
+ const nextDelay=count=>[180000,600000,1800000][Math.min(count-1,2)];
+
  const run=(session,seq)=>{
   if(inflight.has(session.id))return;
   const promise=(async()=>{
@@ -73,8 +92,23 @@ export function installAutoRotation(ctx,configFile,enabled=()=>true){
    if(!core?.store?.db?.prepare('SELECT 1 FROM bindings WHERE session_id=? LIMIT 1').get(session.id))return;
    if(!dream?.configFile?.value?.ownerIdentityId||!core.trustedMemorySession?.(session.id,dream.configFile.value.ownerIdentityId))return;
    if(!rotationInput(ctx.dshHomePath(),session.id,seq,conf).exceeded)return;
-   try{await rotateWithVerifiedMemory({ctx,session,expectedSeq:seq,settings:conf,signal:abort.signal});errors.delete(session.id);ctx.get('pluginDiagnostics')?.record('dsh-lossless-context','info','rotation.completed',{state:'completed'});}
-   catch(error){if(!abort.signal.aborted){ctx.get('pluginDiagnostics')?.record('dsh-lossless-context','error','rotation.failed',{code:error?.code,state:'failed'});errors.set(session.id,error.message);if(errors.size>100)errors.delete(errors.keys().next().value);}}
+   const prior=cooldown[session.id];
+   const dependency=JSON.stringify([conf, dream?.configFile?.value, core?.configFile?.value?.sharedDM]);
+   const fingerprint=sha(dependency);
+   if(prior?.reason==='configuration'&&prior.fingerprint===fingerprint)return;
+   if(prior?.reason==='transient'&&Number.isFinite(prior.nextAt)&&Date.now()<prior.nextAt)return;
+   const started=performance.now();
+   try{
+    await rotateWithVerifiedMemory({ctx,session,expectedSeq:seq,settings:conf,signal:abort.signal});
+    delete cooldown[session.id];save();errors.delete(session.id);
+    ctx.get('pluginDiagnostics')?.record('dsh-lossless-context','info','rotation.completed',{state:'completed',durationMs:Math.round(performance.now()-started)});
+   }catch(error){if(!abort.signal.aborted){
+    const reason=classify(error),count=reason==='transient'?(prior?.reason==='transient'?(prior.count??0)+1:1):0;
+    const nextAt=reason==='transient'?Date.now()+nextDelay(count):0;
+    if(reason!=='busy'){cooldown[session.id]={reason,count,nextAt,fingerprint};save();}
+    ctx.get('pluginDiagnostics')?.record('dsh-lossless-context',reason==='busy'?'info':'warn',reason==='busy'?'rotation.skipped':'rotation.failed',{reason,code:error?.code||error?.name||'unknown',durationMs:Math.round(performance.now()-started),failures:count,nextRetryAt:nextAt||null});
+    errors.set(session.id,String(error.message||error).slice(0,160));if(errors.size>100)errors.delete(errors.keys().next().value);
+   }}
   })().finally(()=>inflight.delete(session.id));
   inflight.add(session.id);
   promise.catch(()=>{});
@@ -96,5 +130,5 @@ export function installAutoRotation(ctx,configFile,enabled=()=>true){
   lastEnd.delete(agent.session.id);run(agent.session,seq);
  },{global:true});
  ctx.effect(()=>()=>{abort.abort();lastEnd.clear();});
- return {status(sessionId){return{busy:inflight.has(sessionId),reason:errors.get(sessionId)||''};},summary(){return{busy:inflight.size,latestError:[...errors.values()].at(-1)||''};},close(){abort.abort();}};
+ return {status(sessionId){return{busy:inflight.has(sessionId),reason:errors.get(sessionId)||'',backoff:cooldown[sessionId]??null};},summary(){const active=Object.values(cooldown).filter(x=>x.reason==='transient'&&x.nextAt>Date.now());return{busy:inflight.size,latestError:[...errors.values()].at(-1)||'',cooldownCount:active.length,nearestRetryAt:active.length?Math.min(...active.map(x=>x.nextAt)):null,configurationBlocked:Object.values(cooldown).filter(x=>x.reason==='configuration').length};},close(){abort.abort();}};
 }

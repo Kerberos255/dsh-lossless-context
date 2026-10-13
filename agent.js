@@ -65,6 +65,7 @@ export default class LosslessCompaction extends BasicCompactionEngine {
     settings.index.auxiliary(agent.session.id,warmId,ordinal++,'warm-leaf',{provider:result.provider,model:result.model,maxTokens:result.maxTokens,usage:result.usage??null,durationMs:Math.round(performance.now()-started),estimatedOutputTokens:this.ctx.tokenMeter.estimateMessage({role:'assistant',content:result.summary})});count++;this.remember(key,result,warmId);
    }
    this.warmStats.prepared+=count;this.warmStats.lastState=count?'已预备 '+count+' 个叶摘要':'缓存已命中或没有可预备片段';
+   this.diagnostics('warm.completed','info',{durationMs:Date.now()-this.warmStats.lastAt,prepared:count,cacheHits:this.warmStats.hits});
   });}finally{if(this.idleAbort===abort){this.idleAbort=null;this.idleAgent=null;}}
  }
  cacheKey(input,agent){return createHash('sha256').update(JSON.stringify([agent.session.id,agent.session.requestHeader()?.config??agent.options,{...this.config,headroomTokens:0},input])).digest('hex');}
@@ -96,7 +97,8 @@ export default class LosslessCompaction extends BasicCompactionEngine {
  }
  async summarizeLossless(input,agent,signal,settings,value){
   const index=settings.index;index.sync(agent.session);const compactionId=index.active(agent.session.id);if(!compactionId)throw new Error('lcm-native-compaction-marker-missing');
-  this.diagnostics('compression.started','info',{sessionId:agent.session.id,provider:agent.session.requestHeader()?.config?.provider,model:agent.session.requestHeader()?.config?.model});
+  const compressionStarted=performance.now();
+  this.diagnostics('compression.started','info',{sessionId:agent.session.id,provider:agent.session.requestHeader()?.config?.provider,model:agent.session.requestHeader()?.config?.model,inputMessages:input.messages.length});
   let plan,available;
   try{({plan,available}=await this.prepare(input,agent,signal,value));}
   catch(error){this.diagnostics('compression.failed','error',{stage:'prepare',code:error?.code||error?.name,error:String(error?.message||error)});throw error;}
@@ -107,7 +109,7 @@ export default class LosslessCompaction extends BasicCompactionEngine {
    catch(error){this.diagnostics('compression.failed','error',{stage:kind,code:error?.code||error?.name,error:String(error?.message||error)});throw error;}
    signal.throwIfAborted();if(kind==='leaf'){this.warmStats.leafRequests++;if(cached)this.warmStats.leafHits++;}if(cached)this.warmStats.hits++;index.auxiliary(agent.session.id,compactionId,ordinal++,kind,{provider:result.provider,model:result.model,maxTokens:result.maxTokens,usage:result.usage??null,cachedFrom:cached?.source??null,estimatedOutputTokens:this.ctx.tokenMeter.estimateMessage({role:'assistant',content:result.summary}),durationMs:Math.round(performance.now()-started)});if(key&&!cached)this.remember(key,result,compactionId);return result;
   };
-  if(plan.groups.length===1){const result=await run(input,'leaf');index.plan(agent.session.id,compactionId,{leaves:[{start:0,end:plan.groups[0].end,summary:summaryText(result)}]});return this.withRecallHint(result,value);}
+  if(plan.groups.length===1){const result=await run(input,'leaf');index.plan(agent.session.id,compactionId,{leaves:[{start:0,end:plan.groups[0].end,summary:summaryText(result)}]});this.diagnostics('compression.completed','info',{durationMs:Math.round(performance.now()-compressionStarted),leafCount:1});return this.withRecallHint(result,value);}
   for(const group of plan.groups){const result=await run({...input,messages:[...(plan.system?[plan.system]:[]),...group.messages]},'leaf');leaves.push({...group,messages:undefined,summary:summaryText(result),result});}
   const dag={leaves:leaves.map(({start,end,summary})=>({start,end,summary})),branches:[],rootChildren:[]};
   let layer=leaves.map((leaf,index)=>({id:'leaf:'+index,text:leaf.summary,result:leaf.result}));
@@ -120,7 +122,7 @@ export default class LosslessCompaction extends BasicCompactionEngine {
    }if(next.length>=layer.length)throw new Error('lcm-condensed-summary-does-not-fit');layer=next;
   }
   const root=dag.branches.pop();dag.rootChildren=root.children;index.plan(agent.session.id,compactionId,dag);
-  this.diagnostics('compression.completed','info',{sessionId:agent.session.id});
+  this.diagnostics('compression.completed','info',{sessionId:agent.session.id,durationMs:Math.round(performance.now()-compressionStarted),leafCount:plan.groups.length,branchCount:dag.branches.length+1});
   const result=layer[0].result;
   return this.withRecallHint(result,value);
  }

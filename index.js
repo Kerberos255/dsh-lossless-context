@@ -21,6 +21,8 @@ export function apply(ctx,legacy={}){
   const warmFailure=lastWarm?.lastError||'无';
   let rotation;try{rotation=inspectRotation(ctx.dshHomePath(),index,settings.configFile.value,liveSeq,{ready,reason});
    if(status?.busy)rotation.rotationStatus+=' · 正在整理 '+status.busy+' 个会话';
+   if(status?.cooldownCount)rotation.rotationStatus+=' · 失败冷却 '+status.cooldownCount+' 个会话（最近允许重试 '+new Date(status.nearestRetryAt).toLocaleTimeString()+'）';
+   if(status?.configurationBlocked)rotation.rotationStatus+=' · 待配置修复 '+status.configurationBlocked+' 个会话';
    if(status?.latestError)rotation.rotationStatus+=' · 最近一次自动轮转中止：'+status.latestError;}
   catch{rotation={rotationStatus:'原生会话元数据暂不可读，自动轮转未运行。'};}
   return {message:error||`已索引 ${index?.stats().indexedEvents??0} 个事件 · ${index?.stats().nodes??0} 个摘要节点 · ${engines.size} 个运行时`,...(index?.stats()??{}),activeEngines:engines.size,warmStatus,warmBudgetStatus,warmFailure,...rotation};
@@ -41,7 +43,9 @@ export function apply(ctx,legacy={}){
   liveSeq.set(session.id,Math.max(liveSeq.get(session.id)??0,event.seq+1));
   if(liveSeq.size>2000)liveSeq.delete(liveSeq.keys().next().value);
   if(!index||!settings.configFile.value.enabled)return;
+  const indexStarted=performance.now();
   try{index.observe(session,event);}catch{error='索引有未同步事件，下次检索将补齐。';}
+  finally {const durationMs=Math.round(performance.now()-indexStarted);if(durationMs>=100)ctx.get('pluginDiagnostics')?.record('dsh-lossless-context','warn','index.slow',{durationMs,eventType:event.type});}
  },{global:true});
  ctx.effect(()=>async()=>{for(const engine of engines)engine.abortSummary();await Promise.allSettled(settings.tasks);index?.close();settings.index=null;});
 }

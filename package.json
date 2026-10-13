@@ -1,11 +1,15 @@
 {
   "name": "dsh-lossless-context",
-  "version": "0.1.21",
+  "version": "0.1.22",
   "private": true,
   "type": "module",
   "description": "使用原生压缩引擎分层整理上下文，保留原始会话并提供检索与展开。",
   "license": "MIT",
   "main": "index.js",
+  "scripts": {
+    "test": "node --test tests/auto-rotation.test.mjs tests/model-picker.test.mjs tests/pressure-budget.test.mjs tests/recall.test.mjs tests/rotation-backoff.test.mjs tests/rotation-guard.test.mjs tests/summarizer-target.test.mjs",
+    "test:host": "node --test tests/rotation-config.test.mjs"
+  },
   "exports": {
     ".": "./index.js",
     "./agent": "./agent.js",

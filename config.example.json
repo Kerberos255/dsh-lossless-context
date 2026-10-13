@@ -9,9 +9,13 @@
   "retainTokens": 0,
   "leafChunkTokens": 8000,
   "condenseFanout": 8,
+  "leafTargetTokens": 2400,
+  "condensedTargetTokens": 2000,
   "summaryMaxTokens": 16384,
   "summaryRetryMaxTokens": 32768,
   "summaryRetries": 2,
+  "compressionTimeoutMs": 120000,
+  "compressionMaxRetries": 1,
   "summaryModel": {
     "provider": "",
     "model": ""
