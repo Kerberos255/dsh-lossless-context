@@ -8,10 +8,10 @@ A **hierarchical context-compaction and retrieval backend** for DSH. Keep the na
 
 - Uses the native DSH compaction transaction; the plugin does **not** replace or delete source session logs.
 - Summarizes bounded, tool-call-safe event groups into a layered source DAG.
-- Exposes `lcm_grep`, `lcm_describe`, `lcm_expand`, and `lcm_expand_query` for authorized session-local retrieval.
-- Adapts headroom and output budgets to the **actual selected model**, with bounded retries for truncated summaries.
+- Exposes `lcm_grep`, `lcm_describe`, and `lcm_expand` for authorized session-local retrieval; `lcm_expand` also accepts a search term (the former `lcm_expand_query` behavior).
+- Adapts headroom, target summary length and output budgets to the **actual selected model**; model failures, timeouts and truncated summaries are handled with bounded attempts and safe commit rules.
 - Can prepare reusable summary leaves during idle maintenance without committing compaction.
-- Optionally rotates eligible owner-verified Discord/Feishu direct-message sessions after a verified [Dream & Memory](https://github.com/Kerberos255/dsh-memory-dreaming) handoff.
+- Optionally rotates eligible owner-verified Discord/Feishu direct-message sessions after a verified [Dream & Memory](https://github.com/Kerberos255/dsh-memory-dreaming) handoff; recent rotation failures are backed off rather than retried every idle turn.
 
 ## Install and enable
 
