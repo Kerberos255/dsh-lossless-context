@@ -9,3 +9,7 @@ Historical behavior notes moved out of README so the entry points do not need ed
 - **Bounded summary output retries:** may enlarge output budgets after recognized truncation without committing incomplete results.
 
 See Git history for exact versions and commits. For current configuration, read [README.md](README.md) / [简体中文](README.zh-CN.md).
+
+## Unreleased · project/task memory and editable prompts
+
+- Add editable summary-quality guidance to leaf and merge compaction while preserving native transactional safety.

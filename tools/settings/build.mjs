@@ -10,7 +10,10 @@ for (const name of selected) if (!Object.hasOwn(pages, name)) throw new Error('U
 for (const [name, page] of Object.entries(pages)) {
   if (selected.length && !selected.includes(name)) continue;
   const directory = root, lib = name === 'dsh-web-search-router' ? path.join(directory, 'lib') : directory;
-  const filename = path.join(lib, 'client.js'), options = { ...page, packageName: name };
+  // Read the shipped example instead of importing DSH host-only peer dependencies.
+  const defaults = JSON.parse(fs.readFileSync(path.join(directory, 'config.example.json'), 'utf8'));
+  const fields = page.fields.map(field => field.resetToDefault ? { ...field, defaultValue: defaults[field.key] } : field);
+  const filename = path.join(lib, 'client.js'), options = { ...page, fields, packageName: name };
   const panelPath=path.join(directory,'client-panel.inc.js'), panel=fs.existsSync(panelPath)?fs.readFileSync(panelPath,'utf8'):'';
   if (page.standalone || name === 'dsh-web-search-router' || name === 'dsh-model-discovery' || name === 'dsh-instruction-files') {
     const credentials = name === 'dsh-web-search-router'

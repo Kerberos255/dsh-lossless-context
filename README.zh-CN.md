@@ -50,3 +50,7 @@ lcm_grep / expand 按序号还原相关原文
 相关：[Dream 与长期记忆](https://github.com/Kerberos255/dsh-memory-dreaming) · [Channel Core](https://github.com/Kerberos255/dsh-channel-core)。
 
 许可证：[MIT](LICENSE)。
+
+## 可编辑摘要质量提示词
+
+叶摘要和合并摘要增加默认的内容保留要求，优先保留技术决策、精确路径、配置键、已验证结果及任务进度变化。设置页支持编辑与「恢复默认」。提示词仅补充 DSH 原生压缩规则，不改变工具配对、取消、原始记录保留与完整事务提交。改变摘要策略后不再复用过期的叶摘要缓存。

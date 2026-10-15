@@ -61,3 +61,15 @@ test('other input fields such as tools survive the injection', async () => {
     { maxTokens: 16384, summaryRetryMaxTokens: 32768, summaryRetries: 2, kind: 'leaf', leafTargetTokens: 2400, condensedTargetTokens: 2000 });
   assert.deepEqual(captured[0].tools, [{ name: 'read' }]);
 });
+
+test('custom summary guidance preserves the native target instruction and leaves source messages intact',async()=>{
+ const {ctx,agent,nativeSummarize,captured}=harness();
+ await summarizeComplete(nativeSummarize,ctx,native,baseInput,agent,null,{
+  maxTokens:16384,summaryRetryMaxTokens:32768,summaryRetries:2,kind:'leaf',
+  leafTargetTokens:2400,condensedTargetTokens:2000,summaryGuidance:'记住原始来源与最新任务状态。'
+ });
+ assert.equal(captured[0].messages.length,2);
+ assert.equal(captured[0].messages[0].content[0].text,'被压缩的对话');
+ assert.match(captured[0].messages.at(-1).content[0].text,/Target length: about 2400 tokens or less/);
+ assert.match(captured[0].messages.at(-1).content[0].text,/记住原始来源与最新任务状态/);
+});

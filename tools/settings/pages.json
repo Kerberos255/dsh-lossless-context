@@ -28,10 +28,28 @@
         "help": "按实际模型窗口计算，并扣除输出预留与安全余量。"
       },
       {
+        "key": "headroomMode",
+        "label": "安全余量模式",
+        "group": "压缩与模型预算",
+        "type": "select",
+        "options": [
+          [
+            "auto",
+            "按模型窗口自适应（推荐）"
+          ],
+          [
+            "fixed",
+            "使用固定数值"
+          ]
+        ],
+        "help": "自适应：取窗口的 10%，最多使用下面设置的余量上限；按模型显式覆盖仍优先。"
+      },
+      {
         "key": "headroomTokens",
-        "label": "安全余量（token）",
+        "label": "安全余量／自动上限（token）",
         "group": "压缩与模型预算",
         "type": "number",
+        "help": "自适应模式为上限（默认 65536），固定模式直接使用这个值。",
         "min": 0,
         "max": 1048576
       },
@@ -70,6 +88,22 @@
         "max": 16
       },
       {
+        "key": "leafTargetTokens",
+        "label": "叶摘要目标长度（token）",
+        "type": "number",
+        "group": "摘要与索引",
+        "advanced": false,
+        "help": "提示模型把每个叶摘要写到这个长度左右。写得太长会撞上输出上限而被截断，太短会丢信息。默认 2400。"
+      },
+      {
+        "key": "condensedTargetTokens",
+        "label": "合并摘要目标长度（token）",
+        "type": "number",
+        "group": "摘要与索引",
+        "advanced": false,
+        "help": "提示模型把合并摘要写到这个长度左右。默认 2000。"
+      },
+      {
         "key": "summaryMaxTokens",
         "label": "首次摘要输出上限（token）",
         "group": "摘要与索引",
@@ -94,7 +128,15 @@
         "type": "number",
         "min": 128,
         "max": 65536,
-        "help": "默认 16384，同时受模型剩余窗口限制；不高于首次上限时不增长。重试调用也会产生模型费用。"
+        "help": "默认 32768，同时受模型剩余窗口限制；不高于首次上限时不增长。重试调用也会产生模型费用。"
+      },
+      {
+        "key": "summaryGuidance",
+        "label": "默认摘要质量提示词",
+        "group": "摘要与索引",
+        "type": "multiline",
+        "resetToDefault": true,
+        "help": "用于叶摘要和合并摘要，只补充信息保留重点，原生压缩协议不受影响。"
       },
       {
         "key": "summaryModel.model",
@@ -118,7 +160,7 @@
         "label": "空闲时预备摘要",
         "group": "空闲整理与检索",
         "type": "boolean",
-        "help": "通过原生 maintenance 预备最多两个叶摘要；新输入优先。正式压缩沿用原生阈值与最近原文保留策略。"
+        "help": "原生 maintenance 在实际压缩阈值之前预备最多两个叶摘要；新输入优先，预备不提交压缩。"
       },
       {
         "key": "deferredRatio",
@@ -128,7 +170,28 @@
         "min": 0.1,
         "max": 0.95,
         "step": "any",
-        "help": "可填写任意小数。实际预备阈值自动取此值与正式压缩阈值中的较小值。"
+        "help": "预备按此比例与实际压缩阈值减去一个叶分块的提前量取较小值；默认 0.75。"
+      },
+      {
+        "key": "warmStatus",
+        "label": "空闲预备运行状态",
+        "group": "空闲整理与检索",
+        "type": "readonly",
+        "detail": "warmStatus"
+      },
+      {
+        "key": "warmBudgetStatus",
+        "label": "最近预备预算",
+        "group": "空闲整理与检索",
+        "type": "readonly",
+        "detail": "warmBudgetStatus"
+      },
+      {
+        "key": "warmFailure",
+        "label": "最近预备错误码",
+        "group": "空闲整理与检索",
+        "type": "readonly",
+        "detail": "warmFailure"
       },
       {
         "key": "recall",

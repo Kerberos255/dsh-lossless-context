@@ -12,6 +12,7 @@
   "leafTargetTokens": 2400,
   "condensedTargetTokens": 2000,
   "summaryMaxTokens": 16384,
+  "summaryGuidance": "优先保留当前任务目标、项目与文件路径、版本和配置键、错误症状及已验证结果、关键决策与理由、未完成步骤及下一步。明确区分事实、计划、推测和已取消方案；同一事项有新进展时保留状态变化与时间，不要把旧“进行中”当作当前状态。保留必要的工具结果定位信息与原文检索线索，不能编造完成情况。",
   "summaryRetryMaxTokens": 32768,
   "summaryRetries": 2,
   "compressionTimeoutMs": 120000,
