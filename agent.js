@@ -1,46 +1,96 @@
-import { BasicCompactionEngine } from '@deepseek-ai/dsh-compaction-basic';
+import { BasicCompactionEngine } from './native/basic-compaction-rc2.js';
 import { toolPairingBalancedBefore, toolPairingBalancedAfter } from '@deepseek-ai/dsh-compaction';
 import { createHash, randomUUID } from 'node:crypto';
 import { nativeConfig } from './config.js';
 import { leafPlan,summaryBudget,summaryText } from './planner.js';
 import { installRecall } from './recall.js';
 import { summarizeComplete } from './summarizer.js';
-import { warmBudget,scopedNativeConfig } from './pressure.js';
+import { warmBudget,scopedNativeConfig,deferredPressureBudget,retainedTailTokens } from './pressure.js';
 
 /** Preset-scoped native backend; all surface commits and replay stay native. */
 export default class LosslessCompaction extends BasicCompactionEngine {
  static inject=BasicCompactionEngine.inject;
  constructor(ctx,config={}){
   const settings=ctx.get('losslessContext');super(ctx,settings?nativeConfig(settings.configFile.value):config);
-  this.settings=null;this.pendingConfig=null;this.summaryAborts=new Set();this.idleAbort=null;this.idleAgent=null;this.idleTimer=null;this.idleTask=null;this.warmed=new Map();this.warmStats={attempts:0,prepared:0,hits:0,leafRequests:0,leafHits:0,failures:0,cancelled:0,lastState:'未开始',lastError:'',lastAt:0,lastThreshold:0,lastTrigger:0,lastHeadroom:0};
+  this.settings=null;this.pendingConfig=null;this.summaryAborts=new Set();this.idleAbort=null;this.idleAgent=null;this.idleTimer=null;this.idleTask=null;this.pendingTurnEnds=new Map();this.postTurnTimer=null;this.postTurnTask=null;this.postTurnAbort=null;this.postTurnAgent=null;this.postTurnStatus='尚未执行';this.warmed=new Map();this.warmStats={attempts:0,prepared:0,hits:0,leafRequests:0,leafHits:0,failures:0,cancelled:0,lastState:'未开始',lastError:'',lastAt:0,lastThreshold:0,lastTrigger:0,lastHeadroom:0};
   ctx.inject(['losslessContext'],scope=>{
    const owner=scope.losslessContext;this.settings=owner;owner.engines.add(this);
-   const update=()=>{this.warmed.clear();this.idleAbort?.abort();const value=nativeConfig(owner.configFile.value);if(this.summaryAborts.size)this.pendingConfig=value;else this.config=value;};update();
+   const update=()=>{this.warmed.clear();this.idleAbort?.abort();this.postTurnAbort?.abort();const value=nativeConfig(owner.configFile.value);if(this.summaryAborts.size)this.pendingConfig=value;else this.config=value;};update();
    const unsubscribe=owner.configFile.subscribe(update),recall=installRecall(scope,()=>this.settings?.index,()=>this.settings?.configFile.value);
    scope.effect(()=>()=>{unsubscribe();recall?.dispose?.();owner.engines.delete(this);this.abortSummary();if(this.settings===owner)this.settings=null;});
   });
-  ctx.on('agent/status',({agent,status})=>{if(status!=='idle'||this.idleTimer||this.idleTask||!this.settings?.configFile.value.deferred)return;this.idleTimer=setTimeout(()=>{this.idleTimer=null;const owner=this.settings,task=this.idleMaintenance(agent).catch(error=>{if(error?.name==='AbortError'||error?.code==='ABORT_ERR'){this.warmStats.cancelled++;this.warmStats.lastState='已取消';return;}this.warmStats.failures++;this.warmStats.lastState='失败';this.warmStats.lastError=String(error?.code||error?.name||'unknown').slice(0,96);});this.idleTask=task;owner?.tasks.add(task);task.finally(()=>{owner?.tasks.delete(task);if(this.idleTask===task)this.idleTask=null;});},100);this.idleTimer.unref?.();});
-  ctx.on('agent/inbox/inserted',({agent})=>{if(this.idleAgent?.session.id===agent.session.id)this.idleAbort?.abort();});
-  ctx.effect(()=>async()=>{clearTimeout(this.idleTimer);this.abortSummary();await this.idleTask?.catch(()=>{});});
+  ctx.on('session/event',(session,event)=>{if(event.type!=='turn/end'||!Number.isSafeInteger(event.seq)||!this.settings?.configFile.value.enabled||!this.settings.configFile.value.automatic||this.settings.configFile.value.compressionTiming!=='after-turn')return;this.pendingTurnEnds.set(session.id,event.seq);if(this.pendingTurnEnds.size>500)this.pendingTurnEnds.delete(this.pendingTurnEnds.keys().next().value);const agent=ctx.get('agents')?.get(session.id);if(agent?.status==='idle')this.queuePostTurn(agent);});
+  ctx.on('agent/status',({agent,status})=>{if(status!=='idle')return;if(this.pendingTurnEnds.has(agent.session.id)&&this.settings?.configFile.value.compressionTiming==='after-turn'){this.queuePostTurn(agent);return;}if(this.idleTimer||this.idleTask||this.postTurnTimer||this.postTurnTask||!this.settings?.configFile.value.deferred)return;this.idleTimer=setTimeout(()=>{this.idleTimer=null;const owner=this.settings,task=this.idleMaintenance(agent).catch(error=>{if(error?.name==='AbortError'||error?.code==='ABORT_ERR'){this.warmStats.cancelled++;this.warmStats.lastState='已取消';return;}this.warmStats.failures++;this.warmStats.lastState='失败';this.warmStats.lastError=String(error?.code||error?.name||'unknown').slice(0,96);});this.idleTask=task;owner?.tasks.add(task);task.finally(()=>{owner?.tasks.delete(task);if(this.idleTask===task)this.idleTask=null;});},100);this.idleTimer.unref?.();});
+  ctx.on('agent/inbox/inserted',({agent})=>{if(this.idleAgent?.session.id===agent.session.id)this.idleAbort?.abort();if(this.postTurnAgent?.session.id===agent.session.id)this.postTurnAbort?.abort();});
+  ctx.effect(()=>async()=>{clearTimeout(this.idleTimer);clearTimeout(this.postTurnTimer);this.abortSummary();await Promise.allSettled([this.idleTask,this.postTurnTask].filter(Boolean));this.pendingTurnEnds.clear();});
  }
- abortSummary(){for(const abort of this.summaryAborts)abort.abort();this.idleAbort?.abort();}
+ abortSummary(){for(const abort of this.summaryAborts)abort.abort();this.idleAbort?.abort();this.postTurnAbort?.abort();}
  diagnostics(event,level='info',data={}){this.ctx.get('pluginDiagnostics')?.record('dsh-lossless-context',level,event,data);}
 
  async compactIfNeeded(agent,trigger,signal){
   const value=this.settings?.configFile.value;
   if(value?.enabled&&value.automatic===false)return null;
-  if(trigger!=='pressure'||value?.headroomMode!=='auto')return super.compactIfNeeded(agent,trigger,signal);
+  if(trigger!=='pressure'||(value?.headroomMode!=='auto'&&value?.compressionTiming!=='after-turn'))return super.compactIfNeeded(agent,trigger,signal);
   const target=agent.session.requestHeader()?.config??agent.options;
   if(!target?.provider||!target?.model)return super.compactIfNeeded(agent,trigger,signal);
   const info=await this.ctx.llm.resolveModelInfo(target.provider,target.model,signal);
   if(!info.context?.contextWindow)return super.compactIfNeeded(agent,trigger,signal);
+  if(value?.compressionTiming==='after-turn'){
+   const policy=this.config.modelPolicies.find(row=>row.provider===target.provider&&row.model===target.model)??{};
+   const budget=deferredPressureBudget({window:info.context.contextWindow,output:target.maxTokens??info.defaultMaxTokens??0,thresholdRatio:this.config.thresholdRatio,headroomTokens:value.headroomTokens,headroomMode:value.headroomMode,override:policy});
+   if(this.ctx.tokenMeter.measure(agent.session).totalTokens<budget.emergencyThreshold)return null;
+   this.diagnostics('compression.emergency','warn',{state:'pressure'});
+  }
+  if(value?.headroomMode!=='auto')return super.compactIfNeeded(agent,trigger,signal);
   const scoped=Object.create(this);
   scoped.rootEngine=this.rootEngine??this;
   scoped.config=scopedNativeConfig(this.config,{provider:target.provider,model:target.model,window:info.context.contextWindow,cap:value.headroomTokens,headroomMode:value.headroomMode});
   return BasicCompactionEngine.prototype.compactIfNeeded.call(scoped,agent,trigger,signal);
  }
+ queuePostTurn(agent){
+  const value=this.settings?.configFile.value;
+  if(!value?.enabled||!value.automatic||value.compressionTiming!=='after-turn'||!this.pendingTurnEnds.has(agent.session.id))return;
+  if(this.postTurnTask||this.postTurnTimer||agent.status!=='idle'||agent.inbox?.hasPending)return;
+  if(this.idleTimer){clearTimeout(this.idleTimer);this.idleTimer=null;}
+  if(this.idleTask){this.idleAbort?.abort();void this.idleTask.finally(()=>this.queuePostTurn(agent));return;}
+  this.postTurnTimer=setTimeout(()=>{
+   this.postTurnTimer=null;
+   if(agent.status!=='idle'||agent.inbox?.hasPending||!this.pendingTurnEnds.has(agent.session.id))return;
+   this.pendingTurnEnds.delete(agent.session.id);
+   const abort=new AbortController(),owner=this.settings;this.postTurnAbort=abort;this.postTurnAgent=agent;
+   const task=this.runPostTurn(agent,abort.signal).catch(error=>{
+    if(abort.signal.aborted||error?.code==='cancelled'||error?.name==='AbortError'){this.postTurnStatus='新消息到达，已取消后台压缩';return;}
+    const code=String(error?.code||error?.name||'UNKNOWN').slice(0,64);
+    this.postTurnStatus='后台压缩失败：'+code;
+    this.diagnostics('compression.deferred-failed','error',{code});
+   }).finally(()=>{
+    owner?.tasks.delete(task);if(this.postTurnTask===task)this.postTurnTask=null;
+    if(this.postTurnAbort===abort){this.postTurnAbort=null;this.postTurnAgent=null;}
+    if(this.pendingTurnEnds.has(agent.session.id)&&agent.status==='idle')this.queuePostTurn(agent);
+   });
+   this.postTurnTask=task;owner?.tasks.add(task);
+  },150);
+  this.postTurnTimer.unref?.();
+ }
+ async runPostTurn(agent,signal){
+  signal.throwIfAborted();
+  if(agent.status!=='idle'||agent.inbox?.hasPending)return;
+  const value=this.settings?.configFile.value,target=agent.session.requestHeader()?.config??agent.options;
+  if(!value?.enabled||!value.automatic||value.compressionTiming!=='after-turn'||!target?.provider||!target?.model)return;
+  const info=await this.ctx.llm.resolveModelInfo(target.provider,target.model,signal);
+  if(!info.context?.contextWindow)return;
+  const override=this.config.modelPolicies.find(row=>row.provider===target.provider&&row.model===target.model)??{};
+  const budget=deferredPressureBudget({window:info.context.contextWindow,output:target.maxTokens??info.defaultMaxTokens??0,thresholdRatio:this.config.thresholdRatio,headroomTokens:value.headroomTokens,headroomMode:value.headroomMode,override});
+  if(this.ctx.tokenMeter.measure(agent.session).totalTokens<budget.threshold){this.postTurnStatus='尚未达到任务后压缩阈值';return;}
+  signal.throwIfAborted();
+  const retainTokens=retainedTailTokens({window:info.context.contextWindow,output:target.maxTokens??info.defaultMaxTokens??0,config:this.config,override});
+  this.postTurnStatus='任务结束后正在压缩';
+  const started=performance.now(),result=await this.compactNow(agent,signal,undefined,retainTokens);
+  if(result){this.postTurnStatus='任务结束后已完成压缩';this.diagnostics('compression.deferred-completed','info',{durationMs:Math.round(performance.now()-started)});}
+  else this.postTurnStatus='没有可安全压缩的完整片段';
+ }
  async idleMaintenance(agent){
-  const settings=this.settings,value=settings?.configFile.value;if(!settings?.index||!value.enabled||!value.automatic||!value.deferred||this.idleAbort||agent.status!=='idle'||agent.inbox.hasPending)return;
+  const settings=this.settings,value=settings?.configFile.value;if(!settings?.index||!value.enabled||!value.automatic||!value.deferred||this.idleAbort||this.postTurnTask||this.postTurnTimer||this.pendingTurnEnds.has(agent.session.id)||agent.status!=='idle'||agent.inbox.hasPending)return;
   const measurement=this.ctx.tokenMeter.measure(agent.session);if(measurement.totalTokens<4096)return;
   const config=agent.session.requestHeader()?.config;if(!config)return;
   const abort=new AbortController();this.idleAbort=abort;this.idleAgent=agent;
@@ -53,7 +103,7 @@ export default class LosslessCompaction extends BasicCompactionEngine {
    if(budget.threshold<=0||budget.trigger<=0){this.warmStats.lastState='模型窗口余量不足';return;}
    if(measurement.totalTokens<budget.trigger){this.warmStats.lastState='等待提前预备';return;}
    this.warmStats.attempts++;this.warmStats.lastAt=Date.now();this.warmStats.lastState='正在预备';this.warmStats.lastError='';
-   const retain=override.retainTokens??(override.retainRatio!==undefined?Math.floor((window-output)*override.retainRatio):(this.config.retainTokens??Math.floor((window-output)*this.config.retainRatio)));
+   const retain=retainedTailTokens({window,output,config:this.config,override});
    const nodes=agent.session.surface.nodes,first=agent.session.deriveEventMessage(agent.session.eventAt(nodes[0]))?.role==='system'?1:0;let from=nodes.length,kept=0;
    for(let i=nodes.length-1;i>=first;i--){from=i;kept+=measurement.nodes[i].tokens;if(kept>=retain)break;}
    while(from>first&&(!toolPairingBalancedBefore(agent.session,nodes[from])||!toolPairingBalancedAfter(agent.session,nodes[from-1])))from--;
@@ -71,7 +121,7 @@ export default class LosslessCompaction extends BasicCompactionEngine {
  cacheKey(input,agent){return createHash('sha256').update(JSON.stringify([agent.session.id,agent.session.requestHeader()?.config??agent.options,{...this.config,headroomTokens:0,summaryGuidance:this.settings?.configFile.value.summaryGuidance??''},input])).digest('hex');}
  cached(key){const row=this.warmed.get(key);if(!row)return null;if(Date.now()-row.at>1800000){this.warmed.delete(key);return null;}return row;}
  remember(key,result,source){this.warmed.set(key,{result,source,at:Date.now()});while(this.warmed.size>64)this.warmed.delete(this.warmed.keys().next().value);}
- completeSummary(input,agent,signal,value,onTruncated,kind){return summarizeComplete(BasicCompactionEngine.prototype.summarize,this.ctx,this.config,input,agent,signal,{...value,kind:kind??'leaf',summaryGuidance:value.summaryGuidance,compressionTimeoutMs:value.compressionTimeoutMs,compressionMaxRetries:value.compressionMaxRetries,onTruncated,onTimeout:info=>this.ctx.get('pluginDiagnostics')?.record('dsh-lossless-context','warn','compression.timeout',info)});}
+ completeSummary(input,agent,signal,value,onTruncated,kind){return summarizeComplete(BasicCompactionEngine.prototype.summarize,this.ctx,this.config,input,agent,signal,{...value,kind:kind??'leaf',summaryGuidance:value.summaryGuidance,compressionTimeoutMs:value.compressionTimeoutMs,compressionMaxRetries:value.compressionMaxRetries,onTruncated,onTimeout:info=>this.ctx.get('pluginDiagnostics')?.record('dsh-lossless-context','warn','compression.timeout',info),onTransient:info=>this.ctx.get('pluginDiagnostics')?.record('dsh-lossless-context','warn','compression.transport-retry',info)});}
  summarize(input,agent,signal){
   const settings=this.settings,value=settings?.configFile.value;
   if(!settings?.index||!value.enabled)return super.summarize(input,agent,signal);

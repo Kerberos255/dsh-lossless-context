@@ -24,3 +24,22 @@ export function scopedNativeConfig(native,{window,headroomMode='auto',cap=65536,
  const headroomTokens=adaptiveHeadroom(window,cap);
  return {...native,headroomTokens};
 }
+
+/** Keep routine pressure for idle maintenance; interrupt an active task only near exhaustion. */
+export function deferredPressureBudget(options) {
+ const budget=pressureBudget(options),{window,output=0}=options;
+ const usable=window-output-budget.safety;
+ const emergency=Math.max(budget.threshold,Math.floor(Math.min(window*0.92,usable*0.94)));
+ return {...budget,emergencyThreshold:Math.max(1,emergency)};
+}
+
+/** Same effective LCM tail policy for busy-turn pressure and idle maintenance. */
+export function retainedTailTokens({window,output=0,config={},override={}}) {
+ const budget=Math.max(0,window-output);
+ const explicit=override.retainTokens!==undefined?override.retainTokens:
+   override.retainRatio!==undefined?undefined:config.retainTokens;
+ const result=explicit!==undefined?explicit:
+   Math.floor(budget*(override.retainRatio??config.retainRatio??0.16));
+ if(!Number.isSafeInteger(result)||result<0)throw new RangeError('invalid LCM retained-tail budget');
+ return result;
+}

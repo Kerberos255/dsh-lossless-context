@@ -2,6 +2,7 @@
   "schemaVersion": 1,
   "enabled": true,
   "automatic": true,
+  "compressionTiming": "after-turn",
   "thresholdRatio": 0.8,
   "headroomMode": "auto",
   "headroomTokens": 65536,

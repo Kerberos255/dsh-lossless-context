@@ -1,6 +1,6 @@
 {
   "name": "dsh-lossless-context",
-  "version": "0.1.24",
+  "version": "0.1.26",
   "private": true,
   "type": "module",
   "description": "使用原生压缩引擎分层整理上下文，保留原始会话并提供检索与展开。",
@@ -23,6 +23,7 @@
   "files": [
     "*.js",
     "plugin-settings/",
+    "native/",
     "locale/",
     "cordis.patch.yml",
     "README.md",

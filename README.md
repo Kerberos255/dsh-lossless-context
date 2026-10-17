@@ -13,6 +13,14 @@ A **hierarchical context-compaction and retrieval backend** for DSH. Keep the na
 - Can prepare reusable summary leaves during idle maintenance without committing compaction.
 - Optionally rotates eligible owner-verified Discord/Feishu direct-message sessions after a verified [Dream & Memory](https://github.com/Kerberos255/dsh-memory-dreaming) handoff; recent rotation failures are backed off rather than retried every idle turn.
 
+## Task-end compaction and retained history
+
+Normal pressure threshold checks now schedule **idle compaction after a completed turn**, while active turns only compact for imminent pressure or provider-confirmed context overflow. Both modes use the same `retainRatio` / `retainTokens` budget (including model-specific policies); the 0.5 threshold controls *when*, not how much recent text is retained.
+
+The installed DSH RC.2 `compactNow` safety path did not expose a retained-tail parameter. The bundled MIT-licensed, narrowly adapted native helper adds that argument and otherwise preserves the native idle maintenance, complete tool-pair boundaries, durable transaction, cancellation, and checkpoint flushing. It must be reviewed again when updating DSH; see `native/SOURCE.md`.
+
+Transport errors and truncated summaries use separate bounded retries; timeout and output budgets are independently configurable. A successful unit test does not substitute for a live model compaction test.
+
 ## Install and enable
 
 Requires a compatible DSH host with its native session, token-meter and compaction services. See [package.json](package.json) for peer dependencies.
