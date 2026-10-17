@@ -15,10 +15,10 @@ A **hierarchical context-compaction and retrieval backend** for DSH. Keep the na
 
 ## Task-end compaction and retained history
 
-The default leaf **source input** chunk is now **24,000 tokens** (not the completion cap), matching the user’s OpenClaw settings. Successful, complete leaf and condensed summaries are cached in the derived local SQLite index for up to 7 days, capped at 128 per session / 512 globally and 128 KiB each. A failed multi-stage compaction never publishes an incomplete checkpoint; next retry or restart reuses fragments only when source content, model and summary settings match. The default per-request summarizer timeout is 240 seconds to allow slower valid merged summaries.
+The default leaf **source input** chunk is **24,000 tokens** (not the completion cap). Successful, complete leaf and condensed summaries are cached in the derived local SQLite index for up to 7 days, capped at 128 per session / 512 globally and 128 KiB each. A failed multi-stage compaction never publishes an incomplete checkpoint; next retry or restart reuses fragments only when source content, model and summary settings match. The default per-request summarizer timeout is 240 seconds to allow slower valid merged summaries.
 
 
-Normal pressure threshold checks now schedule **idle compaction after a completed turn**, while active turns only compact for imminent pressure or provider-confirmed context overflow. Both modes use the same `retainRatio` / `retainTokens` budget (including model-specific policies); the 0.5 threshold controls *when*, not how much recent text is retained.
+Normal pressure threshold checks now schedule **idle compaction after a completed turn**, while active turns only compact for imminent pressure or provider-confirmed context overflow. Both modes use the same `retainRatio` / `retainTokens` budget (including model-specific policies); a threshold such as 0.5 controls *when*, not how much recent text is retained.
 
 The installed DSH RC.2 `compactNow` safety path did not expose a retained-tail parameter. The bundled MIT-licensed, narrowly adapted native helper adds that argument and otherwise preserves the native idle maintenance, complete tool-pair boundaries, durable transaction, cancellation, and checkpoint flushing. It must be reviewed again when updating DSH; see `native/SOURCE.md`.
 
