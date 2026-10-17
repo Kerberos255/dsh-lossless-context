@@ -36,7 +36,7 @@ test('leaf planner preserves each event and complete tool pairs without input ov
  }
  const meter={estimateMessage:message=>Math.ceil(JSON.stringify(message).length/4)};
  const counts=[];
- for(const budget of [8000,12000,16000]){
+ for(const budget of [8000,12000,16000,24000]){
   const {groups}=leafPlan({messages},meter,budget);
   assert.deepEqual(groups.flatMap(group=>group.messages.map(message=>message.id)),messages.map(message=>message.id));
   for(const group of groups){

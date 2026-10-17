@@ -110,17 +110,36 @@ export default class LosslessCompaction extends BasicCompactionEngine {
    if(from<=first){this.warmStats.lastState='旧上下文不足以预备';return;}
    const system=first?agent.session.deriveEventMessage(agent.session.eventAt(nodes[0])):null,input={tools:agent.session.requestHeader()?.tools,messages:[...(system?[system]:[]),...nodes.slice(first,from).map(seq=>agent.session.deriveEventMessage(agent.session.eventAt(seq))).filter(Boolean)]};
    const {plan}=await this.prepare(input,agent,signal,value),warmId='warm:'+randomUUID();let count=0,ordinal=0;
-   for(const group of plan.groups){if(count>=2)break;const payload=plan.groups.length===1?input:{...input,messages:[...(plan.system?[plan.system]:[]),...group.messages]},key=this.cacheKey(payload,agent);if(this.cached(key)){this.warmStats.hits++;continue;}
+   for(const group of plan.groups){if(count>=2)break;const payload=plan.groups.length===1?input:{...input,messages:[...(plan.system?[plan.system]:[]),...group.messages]},key=this.cacheKey(payload,agent,'leaf');if(this.cached(key,agent.session.id)){this.warmStats.hits++;continue;}
     signal.throwIfAborted();const started=performance.now(),result=await this.completeSummary(payload,agent,signal,value,metadata=>settings.index.auxiliary(agent.session.id,warmId,ordinal++,'truncated',metadata),'leaf');signal.throwIfAborted();
-    settings.index.auxiliary(agent.session.id,warmId,ordinal++,'warm-leaf',{provider:result.provider,model:result.model,maxTokens:result.maxTokens,usage:result.usage??null,durationMs:Math.round(performance.now()-started),estimatedOutputTokens:this.ctx.tokenMeter.estimateMessage({role:'assistant',content:result.summary})});count++;this.remember(key,result,warmId);
+    settings.index.auxiliary(agent.session.id,warmId,ordinal++,'warm-leaf',{provider:result.provider,model:result.model,maxTokens:result.maxTokens,usage:result.usage??null,durationMs:Math.round(performance.now()-started),estimatedOutputTokens:this.ctx.tokenMeter.estimateMessage({role:'assistant',content:result.summary})});count++;this.remember(key,result,warmId,agent.session.id);
    }
    this.warmStats.prepared+=count;this.warmStats.lastState=count?'已预备 '+count+' 个叶摘要':'缓存已命中或没有可预备片段';
    this.diagnostics('warm.completed','info',{durationMs:Date.now()-this.warmStats.lastAt,prepared:count,cacheHits:this.warmStats.hits});
   });}finally{if(this.idleAbort===abort){this.idleAbort=null;this.idleAgent=null;}}
  }
- cacheKey(input,agent){return createHash('sha256').update(JSON.stringify([agent.session.id,agent.session.requestHeader()?.config??agent.options,{...this.config,headroomTokens:0,summaryGuidance:this.settings?.configFile.value.summaryGuidance??''},input])).digest('hex');}
- cached(key){const row=this.warmed.get(key);if(!row)return null;if(Date.now()-row.at>1800000){this.warmed.delete(key);return null;}return row;}
- remember(key,result,source){this.warmed.set(key,{result,source,at:Date.now()});while(this.warmed.size>64)this.warmed.delete(this.warmed.keys().next().value);}
+ cacheKey(input,agent,kind='leaf'){
+  const value=this.settings?.configFile.value;
+  // Domain-separate leaves and condensed nodes, and bind every summary-shaping policy.
+  const policy={...this.config,headroomTokens:0,kind,leafTargetTokens:value?.leafTargetTokens??2400,condensedTargetTokens:value?.condensedTargetTokens??2000,summaryGuidance:value?.summaryGuidance??'',summaryRetryMaxTokens:value?.summaryRetryMaxTokens??32768};
+  return createHash('sha256').update(JSON.stringify(['lcm-complete-summary-v2',agent.session.id,agent.session.requestHeader()?.config??agent.options,policy,input])).digest('hex');
+ }
+ cached(key,sessionId){
+  const row=this.warmed.get(key);
+  if(row&&Date.now()-row.at<=1800000)return row;
+  if(row)this.warmed.delete(key);
+  try{
+   const persisted=this.settings?.index?.cacheGet(sessionId,key);
+   if(persisted){this.warmed.set(key,persisted);return persisted;}
+  }catch(error){this.diagnostics('cache.read-failed','warn',{code:String(error?.code??error?.name??'UNKNOWN').slice(0,64)});}
+  return null;
+ }
+ remember(key,result,source,sessionId){
+  this.warmed.set(key,{result,source,at:Date.now()});
+  while(this.warmed.size>64)this.warmed.delete(this.warmed.keys().next().value);
+  try{this.settings?.index?.cachePut(sessionId,key,result,source);}
+  catch(error){this.diagnostics('cache.persist-failed','warn',{code:String(error?.code??error?.name??'UNKNOWN').slice(0,64)});}
+ }
  completeSummary(input,agent,signal,value,onTruncated,kind){return summarizeComplete(BasicCompactionEngine.prototype.summarize,this.ctx,this.config,input,agent,signal,{...value,kind:kind??'leaf',summaryGuidance:value.summaryGuidance,compressionTimeoutMs:value.compressionTimeoutMs,compressionMaxRetries:value.compressionMaxRetries,onTruncated,onTimeout:info=>this.ctx.get('pluginDiagnostics')?.record('dsh-lossless-context','warn','compression.timeout',info),onTransient:info=>this.ctx.get('pluginDiagnostics')?.record('dsh-lossless-context','warn','compression.transport-retry',info)});}
  summarize(input,agent,signal){
   const settings=this.settings,value=settings?.configFile.value;
@@ -154,10 +173,10 @@ export default class LosslessCompaction extends BasicCompactionEngine {
   catch(error){this.diagnostics('compression.failed','error',{stage:'prepare',code:error?.code||error?.name,error:String(error?.message||error)});throw error;}
   const leaves=[];let ordinal=0;
   const run=async(payload,kind)=>{
-   signal.throwIfAborted();const started=performance.now(),key=kind==='leaf'?this.cacheKey(payload,agent):null,cached=key?this.cached(key):null;let result;
+   signal.throwIfAborted();const started=performance.now(),key=this.cacheKey(payload,agent,kind),cached=this.cached(key,agent.session.id);let result;
    try{result=cached?{...cached.result,usage:undefined,rawOutput:undefined,llmStreamCall:false}:await this.completeSummary(payload,agent,signal,value,metadata=>index.auxiliary(agent.session.id,compactionId,ordinal++,'truncated',metadata),kind);}
    catch(error){this.diagnostics('compression.failed','error',{stage:kind,code:error?.code||error?.name,error:String(error?.message||error)});throw error;}
-   signal.throwIfAborted();if(kind==='leaf'){this.warmStats.leafRequests++;if(cached)this.warmStats.leafHits++;}if(cached)this.warmStats.hits++;index.auxiliary(agent.session.id,compactionId,ordinal++,kind,{provider:result.provider,model:result.model,maxTokens:result.maxTokens,usage:result.usage??null,cachedFrom:cached?.source??null,estimatedOutputTokens:this.ctx.tokenMeter.estimateMessage({role:'assistant',content:result.summary}),durationMs:Math.round(performance.now()-started)});if(key&&!cached)this.remember(key,result,compactionId);return result;
+   signal.throwIfAborted();if(kind==='leaf'){this.warmStats.leafRequests++;if(cached)this.warmStats.leafHits++;}if(cached)this.warmStats.hits++;index.auxiliary(agent.session.id,compactionId,ordinal++,kind,{provider:result.provider,model:result.model,maxTokens:result.maxTokens,usage:result.usage??null,cachedFrom:cached?.source??null,estimatedOutputTokens:this.ctx.tokenMeter.estimateMessage({role:'assistant',content:result.summary}),durationMs:Math.round(performance.now()-started)});if(!cached)this.remember(key,result,compactionId,agent.session.id);return result;
   };
   if(plan.groups.length===1){const result=await run(input,'leaf');index.plan(agent.session.id,compactionId,{leaves:[{start:0,end:plan.groups[0].end,summary:summaryText(result)}]});this.diagnostics('compression.completed','info',{durationMs:Math.round(performance.now()-compressionStarted),leafCount:1});return this.withRecallHint(result,value);}
   for(const group of plan.groups){const result=await run({...input,messages:[...(plan.system?[plan.system]:[]),...group.messages]},'leaf');leaves.push({...group,messages:undefined,summary:summaryText(result),result});}

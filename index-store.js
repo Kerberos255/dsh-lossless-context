@@ -32,6 +32,8 @@ export class LosslessIndex {
    CREATE TABLE IF NOT EXISTS lcm_compactions(session_id TEXT NOT NULL,id TEXT NOT NULL,start_seq INTEGER NOT NULL,summary_seq INTEGER,shadowed TEXT,plan TEXT,state TEXT NOT NULL,PRIMARY KEY(session_id,id));
    CREATE TABLE IF NOT EXISTS lcm_nodes(session_id TEXT NOT NULL,id TEXT NOT NULL,compaction_id TEXT NOT NULL,kind TEXT NOT NULL,depth INTEGER NOT NULL,summary_seq INTEGER,summary TEXT,source_seqs TEXT NOT NULL,children TEXT NOT NULL,PRIMARY KEY(session_id,id));
    CREATE TABLE IF NOT EXISTS lcm_aux_calls(session_id TEXT,id TEXT,ordinal INTEGER,kind TEXT,metadata TEXT,PRIMARY KEY(session_id,id,ordinal));
+   CREATE TABLE IF NOT EXISTS lcm_summary_cache(session_id TEXT NOT NULL,cache_key TEXT NOT NULL,payload TEXT NOT NULL,digest TEXT NOT NULL,source TEXT NOT NULL,cached_at INTEGER NOT NULL,PRIMARY KEY(session_id,cache_key));
+   CREATE INDEX IF NOT EXISTS lcm_summary_cache_age ON lcm_summary_cache(cached_at);
   `);
  }
  tx(fn){this.db.exec('BEGIN IMMEDIATE');try{const result=fn();this.db.exec('COMMIT');return result;}catch(error){this.db.exec('ROLLBACK');throw error;}}
@@ -66,6 +68,42 @@ export class LosslessIndex {
  }
  active(sessionId){return this.db.prepare("SELECT id FROM lcm_compactions WHERE session_id=? AND state='running' ORDER BY start_seq DESC LIMIT 1").get(sessionId)?.id;}
  plan(sessionId,id,plan){if(this.closed)throw new Error('lcm-index-closed');this.db.prepare('UPDATE lcm_compactions SET plan=? WHERE session_id=? AND id=?').run(JSON.stringify(plan),sessionId,id);}
+
+/** Successful, complete summary fragments only. Never stores source transcripts. */
+cacheGet(sessionId,key){
+ if(this.closed)return null;
+ const row=this.db.prepare('SELECT payload,digest,source,cached_at FROM lcm_summary_cache WHERE session_id=? AND cache_key=?').get(sessionId,key);
+ if(!row)return null;
+ if(row.cached_at<Date.now()-7*86400000||hash(row.payload)!==row.digest){
+  this.db.prepare('DELETE FROM lcm_summary_cache WHERE session_id=? AND cache_key=?').run(sessionId,key);return null;
+ }
+ let result;
+ try{result=JSON.parse(row.payload);}catch{return null;}
+ if(!this.validSummary(result))return null;
+ return {result,source:row.source,at:row.cached_at};
+}
+validSummary(result){
+ return result&&typeof result==='object'&&Array.isArray(result.summary)&&result.summary.length>0
+  &&result.summary.every(block=>block&&block.type==='text'&&typeof block.text==='string')
+  &&result.summary.some(block=>block.text.trim().length>0)
+  &&typeof result.provider==='string'&&typeof result.model==='string'
+  &&Number.isSafeInteger(result.maxTokens)&&result.maxTokens>0;
+}
+cachePut(sessionId,key,result,source){
+ if(this.closed||!this.validSummary(result))return false;
+ const minimized={summary:result.summary,provider:result.provider,model:result.model,maxTokens:result.maxTokens};
+ const payload=JSON.stringify(minimized);
+ if(Buffer.byteLength(payload,'utf8')>131072)return false;
+ const now=Date.now();
+ this.tx(()=>{
+  const insert=this.db.prepare('INSERT INTO lcm_summary_cache(session_id,cache_key,payload,digest,source,cached_at) VALUES(?,?,?,?,?,?) ON CONFLICT(session_id,cache_key) DO UPDATE SET payload=excluded.payload,digest=excluded.digest,source=excluded.source,cached_at=excluded.cached_at');
+  insert.run(sessionId,key,payload,hash(payload),source,now);
+  this.db.prepare('DELETE FROM lcm_summary_cache WHERE cached_at < ?').run(now-7*86400000);
+  this.db.prepare('DELETE FROM lcm_summary_cache WHERE rowid IN (SELECT rowid FROM lcm_summary_cache WHERE session_id=? ORDER BY cached_at DESC,rowid DESC LIMIT -1 OFFSET 128)').run(sessionId);
+  this.db.prepare('DELETE FROM lcm_summary_cache WHERE rowid IN (SELECT rowid FROM lcm_summary_cache ORDER BY cached_at DESC,rowid DESC LIMIT -1 OFFSET 512)').run();
+ });
+ return true;
+}
  auxiliary(sessionId,id,ordinal,kind,metadata){if(this.closed)throw new Error('lcm-index-closed');this.db.prepare('INSERT OR REPLACE INTO lcm_aux_calls VALUES(?,?,?,?,?)').run(sessionId,id,ordinal,kind,JSON.stringify(metadata));}
  commitNodes(session,row){
   const seqs=JSON.parse(row.shadowed),messageSeqs=seqs.filter(seq=>session.deriveEventMessage(session.eventAt(seq))!=null),plan=row.plan?JSON.parse(row.plan):{leaves:[]},leaves=Array.isArray(plan)?plan:plan.leaves,id=row.id;
@@ -83,7 +121,7 @@ export class LosslessIndex {
  sources(sessionId,id,{maxEvents=1000000}={}){
   const result=new Set(),visited=new Set();const walk=nodeId=>{if(visited.has(nodeId))return;visited.add(nodeId);const node=this.node(sessionId,nodeId);if(!node)throw new Error('lcm-node-not-found');for(const child of node.children)walk(child);for(const seq of node.sourceSeqs)if(result.size<maxEvents)result.add(seq);};walk(id);return [...result].sort((a,b)=>a-b);
  }
- stats(){return {indexedEvents:this.db.prepare('SELECT count(*) AS n FROM lcm_refs').get().n,nodes:this.db.prepare('SELECT count(*) AS n FROM lcm_nodes').get().n,auxiliaryCalls:this.db.prepare('SELECT count(*) AS n FROM lcm_aux_calls').get().n,activeCompactions:this.db.prepare("SELECT count(*) AS n FROM lcm_compactions WHERE state='running'").get().n};}
- reset(sessionId){const ids=this.db.prepare('SELECT id FROM lcm_refs WHERE session_id=?').all(sessionId);for(const {id}of ids)this.db.prepare('DELETE FROM lcm_terms WHERE rowid=?').run(id);for(const table of ['lcm_refs','lcm_compactions','lcm_nodes','lcm_aux_calls','lcm_cursor'])this.db.prepare(`DELETE FROM ${table} WHERE session_id=?`).run(sessionId);}
+ stats(){return {indexedEvents:this.db.prepare('SELECT count(*) AS n FROM lcm_refs').get().n,nodes:this.db.prepare('SELECT count(*) AS n FROM lcm_nodes').get().n,auxiliaryCalls:this.db.prepare('SELECT count(*) AS n FROM lcm_aux_calls').get().n,activeCompactions:this.db.prepare("SELECT count(*) AS n FROM lcm_compactions WHERE state='running'").get().n,cachedSummaries:this.db.prepare('SELECT count(*) AS n FROM lcm_summary_cache').get().n};}
+ reset(sessionId){const ids=this.db.prepare('SELECT id FROM lcm_refs WHERE session_id=?').all(sessionId);for(const {id}of ids)this.db.prepare('DELETE FROM lcm_terms WHERE rowid=?').run(id);for(const table of ['lcm_refs','lcm_compactions','lcm_nodes','lcm_aux_calls','lcm_summary_cache','lcm_cursor'])this.db.prepare(`DELETE FROM ${table} WHERE session_id=?`).run(sessionId);}
  close(){if(this.closed)return;this.closed=true;this.db.close();}
 }
