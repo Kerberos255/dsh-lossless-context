@@ -28,9 +28,15 @@ export function scopedNativeConfig(native,{window,headroomMode='auto',cap=65536,
 /** Keep routine pressure for idle maintenance; interrupt an active task only near exhaustion. */
 export function deferredPressureBudget(options) {
  const budget=pressureBudget(options),{window,output=0}=options;
- const usable=window-output-budget.safety;
- const emergency=Math.max(budget.threshold,Math.floor(Math.min(window*0.92,usable*0.94)));
- return {...budget,emergencyThreshold:Math.max(1,emergency)};
+ // Configured output can be the provider's very large absolute maximum,
+ // not the amount normally generated in a step. Reserving all of it would
+ // turn a 50% routine threshold into a spurious ~52% emergency threshold.
+ // Use a bounded *forecast* for proactive interruption. Genuine provider
+ // context overflows still follow the native recovery path.
+ const emergencyOutputReserve=Math.min(Math.max(0,output),Math.max(16384,Math.floor(window*0.05)));
+ const usable=window-emergencyOutputReserve-budget.safety;
+ const emergency=Math.max(budget.threshold,Math.min(Math.floor(window*0.90),usable));
+ return {...budget,emergencyOutputReserve,emergencyThreshold:Math.max(1,emergency)};
 }
 
 /** Same effective LCM tail policy for busy-turn pressure and idle maintenance. */

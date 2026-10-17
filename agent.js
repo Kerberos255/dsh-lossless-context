@@ -12,17 +12,17 @@ export default class LosslessCompaction extends BasicCompactionEngine {
  static inject=BasicCompactionEngine.inject;
  constructor(ctx,config={}){
   const settings=ctx.get('losslessContext');super(ctx,settings?nativeConfig(settings.configFile.value):config);
-  this.settings=null;this.pendingConfig=null;this.summaryAborts=new Set();this.idleAbort=null;this.idleAgent=null;this.idleTimer=null;this.idleTask=null;this.pendingTurnEnds=new Map();this.postTurnTimer=null;this.postTurnTask=null;this.postTurnAbort=null;this.postTurnAgent=null;this.postTurnStatus='尚未执行';this.warmed=new Map();this.warmStats={attempts:0,prepared:0,hits:0,leafRequests:0,leafHits:0,failures:0,cancelled:0,lastState:'未开始',lastError:'',lastAt:0,lastThreshold:0,lastTrigger:0,lastHeadroom:0};
+  this.settings=null;this.pendingConfig=null;this.summaryAborts=new Set();this.idleAbort=null;this.idleAgent=null;this.idleTimer=null;this.idleTask=null;this.pendingTurnEnds=new Map();this.postTurnBusyRetries=new Map();this.postTurnTimer=null;this.postTurnTask=null;this.postTurnAbort=null;this.postTurnAgent=null;this.postTurnStatus='尚未执行';this.warmed=new Map();this.warmStats={attempts:0,prepared:0,hits:0,leafRequests:0,leafHits:0,failures:0,cancelled:0,lastState:'未开始',lastError:'',lastAt:0,lastThreshold:0,lastTrigger:0,lastHeadroom:0};
   ctx.inject(['losslessContext'],scope=>{
    const owner=scope.losslessContext;this.settings=owner;owner.engines.add(this);
    const update=()=>{this.warmed.clear();this.idleAbort?.abort();this.postTurnAbort?.abort();const value=nativeConfig(owner.configFile.value);if(this.summaryAborts.size)this.pendingConfig=value;else this.config=value;};update();
    const unsubscribe=owner.configFile.subscribe(update),recall=installRecall(scope,()=>this.settings?.index,()=>this.settings?.configFile.value);
    scope.effect(()=>()=>{unsubscribe();recall?.dispose?.();owner.engines.delete(this);this.abortSummary();if(this.settings===owner)this.settings=null;});
   });
-  ctx.on('session/event',(session,event)=>{if(event.type!=='turn/end'||!Number.isSafeInteger(event.seq)||!this.settings?.configFile.value.enabled||!this.settings.configFile.value.automatic||this.settings.configFile.value.compressionTiming!=='after-turn')return;this.pendingTurnEnds.set(session.id,event.seq);if(this.pendingTurnEnds.size>500)this.pendingTurnEnds.delete(this.pendingTurnEnds.keys().next().value);const agent=ctx.get('agents')?.get(session.id);if(agent?.status==='idle')this.queuePostTurn(agent);});
+  ctx.on('session/event',(session,event)=>{if(event.type!=='turn/end'||!Number.isSafeInteger(event.seq)||!this.settings?.configFile.value.enabled||!this.settings.configFile.value.automatic||this.settings.configFile.value.compressionTiming!=='after-turn')return;this.postTurnBusyRetries.delete(session.id);this.pendingTurnEnds.set(session.id,event.seq);if(this.pendingTurnEnds.size>500)this.pendingTurnEnds.delete(this.pendingTurnEnds.keys().next().value);const agent=ctx.get('agents')?.get(session.id);if(agent?.status==='idle')this.queuePostTurn(agent);});
   ctx.on('agent/status',({agent,status})=>{if(status!=='idle')return;if(this.pendingTurnEnds.has(agent.session.id)&&this.settings?.configFile.value.compressionTiming==='after-turn'){this.queuePostTurn(agent);return;}if(this.idleTimer||this.idleTask||this.postTurnTimer||this.postTurnTask||!this.settings?.configFile.value.deferred)return;this.idleTimer=setTimeout(()=>{this.idleTimer=null;const owner=this.settings,task=this.idleMaintenance(agent).catch(error=>{if(error?.name==='AbortError'||error?.code==='ABORT_ERR'){this.warmStats.cancelled++;this.warmStats.lastState='已取消';return;}this.warmStats.failures++;this.warmStats.lastState='失败';this.warmStats.lastError=String(error?.code||error?.name||'unknown').slice(0,96);});this.idleTask=task;owner?.tasks.add(task);task.finally(()=>{owner?.tasks.delete(task);if(this.idleTask===task)this.idleTask=null;});},100);this.idleTimer.unref?.();});
   ctx.on('agent/inbox/inserted',({agent})=>{if(this.idleAgent?.session.id===agent.session.id)this.idleAbort?.abort();if(this.postTurnAgent?.session.id===agent.session.id)this.postTurnAbort?.abort();});
-  ctx.effect(()=>async()=>{clearTimeout(this.idleTimer);clearTimeout(this.postTurnTimer);this.abortSummary();await Promise.allSettled([this.idleTask,this.postTurnTask].filter(Boolean));this.pendingTurnEnds.clear();});
+  ctx.effect(()=>async()=>{clearTimeout(this.idleTimer);clearTimeout(this.postTurnTimer);this.abortSummary();await Promise.allSettled([this.idleTask,this.postTurnTask].filter(Boolean));this.pendingTurnEnds.clear();this.postTurnBusyRetries.clear();});
  }
  abortSummary(){for(const abort of this.summaryAborts)abort.abort();this.idleAbort?.abort();this.postTurnAbort?.abort();}
  diagnostics(event,level='info',data={}){this.ctx.get('pluginDiagnostics')?.record('dsh-lossless-context',level,event,data);}
@@ -47,7 +47,8 @@ export default class LosslessCompaction extends BasicCompactionEngine {
   scoped.config=scopedNativeConfig(this.config,{provider:target.provider,model:target.model,window:info.context.contextWindow,cap:value.headroomTokens,headroomMode:value.headroomMode});
   return BasicCompactionEngine.prototype.compactIfNeeded.call(scoped,agent,trigger,signal);
  }
- queuePostTurn(agent){
+ queuePostTurn(agent,delayMs=150){
+  this.postTurnBusyRetries??=new Map();
   const value=this.settings?.configFile.value;
   if(!value?.enabled||!value.automatic||value.compressionTiming!=='after-turn'||!this.pendingTurnEnds.has(agent.session.id))return;
   if(this.postTurnTask||this.postTurnTimer||agent.status!=='idle'||agent.inbox?.hasPending)return;
@@ -56,20 +57,33 @@ export default class LosslessCompaction extends BasicCompactionEngine {
   this.postTurnTimer=setTimeout(()=>{
    this.postTurnTimer=null;
    if(agent.status!=='idle'||agent.inbox?.hasPending||!this.pendingTurnEnds.has(agent.session.id))return;
+   const turnSeq=this.pendingTurnEnds.get(agent.session.id);
    this.pendingTurnEnds.delete(agent.session.id);
    const abort=new AbortController(),owner=this.settings;this.postTurnAbort=abort;this.postTurnAgent=agent;
    const task=this.runPostTurn(agent,abort.signal).catch(error=>{
     if(abort.signal.aborted||error?.code==='cancelled'||error?.name==='AbortError'){this.postTurnStatus='新消息到达，已取消后台压缩';return;}
     const code=String(error?.code||error?.name||'UNKNOWN').slice(0,64);
+    const attempts=this.postTurnBusyRetries.get(agent.session.id)??0;
+    if(code.toLowerCase()==='busy'&&attempts<3){
+     this.postTurnBusyRetries.set(agent.session.id,attempts+1);
+     if(!this.pendingTurnEnds.has(agent.session.id))this.pendingTurnEnds.set(agent.session.id,turnSeq);
+     this.postTurnStatus='原生维护事务暂忙，等待下一次空闲重试';
+     this.diagnostics('compression.deferred-busy-retry','warn',{attempt:attempts+1});
+     return;
+    }
+    this.postTurnBusyRetries.delete(agent.session.id);
     this.postTurnStatus='后台压缩失败：'+code;
     this.diagnostics('compression.deferred-failed','error',{code});
    }).finally(()=>{
     owner?.tasks.delete(task);if(this.postTurnTask===task)this.postTurnTask=null;
     if(this.postTurnAbort===abort){this.postTurnAbort=null;this.postTurnAgent=null;}
-    if(this.pendingTurnEnds.has(agent.session.id)&&agent.status==='idle')this.queuePostTurn(agent);
+    if(this.pendingTurnEnds.has(agent.session.id)&&agent.status==='idle'){
+     const retries=this.postTurnBusyRetries.get(agent.session.id)??0;
+     this.queuePostTurn(agent,retries?Math.min(1200*2**(retries-1),4800):150);
+    }else if(!this.pendingTurnEnds.has(agent.session.id))this.postTurnBusyRetries.delete(agent.session.id);
    });
    this.postTurnTask=task;owner?.tasks.add(task);
-  },150);
+  },delayMs);
   this.postTurnTimer.unref?.();
  }
  async runPostTurn(agent,signal){

@@ -22,6 +22,8 @@ Normal pressure threshold checks now schedule **idle compaction after a complete
 
 The installed DSH RC.2 `compactNow` safety path did not expose a retained-tail parameter. The bundled MIT-licensed, narrowly adapted native helper adds that argument and otherwise preserves the native idle maintenance, complete tool-pair boundaries, durable transaction, cancellation, and checkpoint flushing. It must be reviewed again when updating DSH; see `native/SOURCE.md`.
 
+A provider can advertise a very high absolute `maxTokens` ceiling. Proactive emergency compaction now uses a bounded output forecast, rather than treating that entire ceiling as the expected next completion. It targets near-window pressure while preserving the native context-overflow recovery path; exceptionally long generations can still exceed the forecast. Idle compaction retries a temporarily busy native maintenance slot up to three times, only while the agent is idle.
+
 Transport errors and truncated summaries use separate bounded retries; timeout and output budgets are independently configurable. A successful unit test does not substitute for a live model compaction test.
 
 ## Install and enable

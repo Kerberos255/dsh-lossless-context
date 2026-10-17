@@ -136,3 +136,31 @@ test('native idle compaction respects retained tail and avoids opening a transac
  assert.equal(flushCount,0);
  await assert.rejects(engine.compactNow(agent,new AbortController().signal,undefined,-1),RangeError);
 });
+
+test('a huge model maximum output does not make a 1M context emergency start at 51.7%',()=>{
+ const p=deferredPressureBudget({window:1000000,output:384000,thresholdRatio:0.5,headroomMode:'auto',headroomTokens:65536});
+ assert.equal(p.safety,65536);
+ assert.equal(p.threshold,500000);
+ assert.equal(p.emergencyOutputReserve,50000);
+ assert.equal(p.emergencyThreshold,884464);
+ assert(p.emergencyThreshold>880000);
+});
+
+test('post-turn busy native maintenance is retried after idle instead of discarded',async()=>{
+ const agent=makeAgent();
+ const engine=Object.create(LosslessCompaction.prototype);
+ engine.settings={configFile:{value:{enabled:true,automatic:true,compressionTiming:'after-turn'}},tasks:new Set()};
+ engine.pendingTurnEnds=new Map([[agent.session.id,7]]);
+ engine.idleTimer=null;engine.idleTask=null;engine.postTurnTimer=null;engine.postTurnTask=null;
+ engine.postTurnAbort=null;engine.postTurnAgent=null;
+ const events=[];engine.diagnostics=ev=>events.push(ev);
+ let attempts=0;
+ engine.runPostTurn=async()=>{attempts++;if(attempts===1)throw Object.assign(new Error('native maintenance busy'),{code:'busy'});};
+ engine.queuePostTurn(agent);
+ await sleep(1750);
+ assert.equal(attempts,2);
+ assert.equal(engine.pendingTurnEnds.has(agent.session.id),false);
+ assert.equal(engine.postTurnBusyRetries.size,0);
+ assert.equal(engine.settings.tasks.size,0);
+ assert(events.includes('compression.deferred-busy-retry'));
+});
