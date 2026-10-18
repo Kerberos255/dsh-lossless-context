@@ -209,5 +209,5 @@ export default class LosslessCompaction extends BasicCompactionEngine {
   const result=layer[0].result;
   return this.withRecallHint(result,value);
  }
- withRecallHint(result,value){return value.promptAwareRecall?{...result,summary:[...result.summary,{type:'text',text:'需要精确原文时，可用 lcm_grep 检索当前会话，或 lcm_describe / lcm_expand 按摘要节点展开；超长工具原文可通过 DSH 提供的完整结果文件读取。'}]}:result;}
+ withRecallHint(result,value){return value.promptAwareRecall?{...result,summary:[...result.summary,{type:'text',text:'需要精确原文时，可用 lcm_recall（action=search/describe/expand）检索或按摘要节点展开当前会话；超长工具原文可通过 DSH 提供的完整结果文件读取。'}]}:result;}
 }

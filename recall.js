@@ -29,10 +29,27 @@ export function recall(index,session,kind,args,{maxRecallChars=16000}={}){
 }
 export function installRecall(ctx,getIndex,getConfig){
  return ctx.inject(['tools'],scope=>{
-  for(const [name,kind,description]of [['lcm_grep','grep','在当前会话原文中检索词语，支持中文；返回事件序号和简短片段。'],['lcm_describe','describe','查看当前会话摘要 DAG 节点及来源。'],['lcm_expand','expand','按事件序号、摘要节点或检索词展开当前会话原文；按 offset 分页读取，返回长度受配置限制。']])scope.tools.register({name,description,
-   parameters:{type:'object',properties:{query:{type:'string'},id:{type:'string'},seq:{type:'integer',minimum:0},limit:{type:'integer',minimum:1,maximum:50},offset:{type:'integer',minimum:0}},additionalProperties:false},
+  scope.tools.register({
+   name:'lcm_recall',
+   description:'只读召回当前 Session 原文。action=search（默认）检索片段，action=describe 查看摘要 DAG，action=expand 按 seq、id 或 query 分段展开完整原文。仅访问调用者当前 Session。',
+   parameters:{type:'object',properties:{
+    action:{type:'string',enum:['search','describe','expand']},
+    query:{type:'string'},id:{type:'string'},seq:{type:'integer',minimum:0},
+    limit:{type:'integer',minimum:1,maximum:50},offset:{type:'integer',minimum:0}
+   },additionalProperties:false},
    output:{schema:{type:'object',additionalProperties:true},render:(_args,value)=>[{type:'text',text:JSON.stringify(value)}]},
-   async execute(args,exec){exec.signal.throwIfAborted();const index=getIndex(),config=getConfig();if(!index||!config?.enabled||!config.recall||!exec.agent)throw new Error('lcm-recall-unavailable');return recall(index,exec.agent.session,kind,args,config);},
+   async execute(args,exec){
+    exec.signal.throwIfAborted();
+    const index=getIndex(),config=getConfig();
+    if(!index||!config?.enabled||!config.recall||!exec.agent?.session)throw new Error('lcm-recall-unavailable');
+    const action=args.action??'search';
+    if(action==='search'&&(typeof args.query!=='string'||!args.query.trim()||args.id!==undefined||args.seq!==undefined||args.offset!==undefined))throw new Error('lcm-search-arguments-invalid');
+    if(action==='describe'&&(args.query!==undefined||args.seq!==undefined||args.offset!==undefined))throw new Error('lcm-describe-arguments-invalid');
+    if(action==='expand'&&[args.query!==undefined&&!!args.query.trim(),args.id!==undefined,args.seq!==undefined].filter(Boolean).length!==1)throw new Error('lcm-expand-source-invalid');
+    const value=recall(index,exec.agent.session,action==='search'?'grep':action,args,config);
+    exec.signal.throwIfAborted();
+    return value;
+   }
   });
  });
 }

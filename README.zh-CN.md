@@ -8,7 +8,7 @@
 
 - 保留原生 Session Log，压缩提交与取消继续由 DSH 事务负责。
 - 将选定旧上下文按事件与工具调用配对安全地拆成摘要叶，再合并成可检索的来源 DAG。
-- 提供 `lcm_grep`、`lcm_describe`、`lcm_expand`；`lcm_expand` 已支持按检索词展开，不再单独提供旧的 `lcm_expand_query` 工具。
+- 模型只提供一个 `lcm_recall` 工具：`action=search`（默认）检索片段、`action=describe` 查看摘要 DAG、`action=expand` 按事件序号、摘要节点或关键词展开原文。
 - 按实际模型上下文窗口、Token Meter、目标摘要长度与输出上限计算预算；超时、截断或模型失败采用有界处理，不提交不完整摘要。
 - 可以空闲预生成摘要叶，不提前替换正式上下文。
 - 可选在主人身份已核验、Dream 交接已完成后，自动轮转符合条件的 Discord/飞书私聊 Session。
