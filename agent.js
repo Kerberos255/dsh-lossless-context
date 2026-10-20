@@ -7,22 +7,35 @@ import { installRecall } from './recall.js';
 import { summarizeComplete } from './summarizer.js';
 import { warmBudget,scopedNativeConfig,deferredPressureBudget,retainedTailTokens } from './pressure.js';
 
+/** Preserve safe failure codes without persisting model output or provider messages. */
+export function summaryFailureCode(error){
+ const code=typeof error?.code==='string'?error.code:'';
+ if(/^[A-Z][A-Z0-9_]{1,31}$/.test(code))return code;
+ const message=String(error?.message??'');
+ if(message==='summarization produced no text summary content')return 'SUMMARY_EMPTY';
+ if(message.startsWith('summarization truncated at the token cap'))return 'MAX_TOKENS';
+ if(message==='lcm-summary-model-budget-too-small')return 'SUMMARY_BUDGET';
+ return 'SUMMARY_UNKNOWN';
+}
+
 /** Preset-scoped native backend; all surface commits and replay stay native. */
 export default class LosslessCompaction extends BasicCompactionEngine {
  static inject=BasicCompactionEngine.inject;
  constructor(ctx,config={}){
   const settings=ctx.get('losslessContext');super(ctx,settings?nativeConfig(settings.configFile.value):config);
-  this.settings=null;this.pendingConfig=null;this.summaryAborts=new Set();this.idleAbort=null;this.idleAgent=null;this.idleTimer=null;this.idleTask=null;this.pendingTurnEnds=new Map();this.postTurnBusyRetries=new Map();this.postTurnTimer=null;this.postTurnTask=null;this.postTurnAbort=null;this.postTurnAgent=null;this.postTurnStatus='尚未执行';this.warmed=new Map();this.warmStats={attempts:0,prepared:0,hits:0,leafRequests:0,leafHits:0,failures:0,cancelled:0,lastState:'未开始',lastError:'',lastAt:0,lastThreshold:0,lastTrigger:0,lastHeadroom:0};
+  this.settings=null;this.pendingConfig=null;this.summaryAborts=new Set();this.idleAbort=null;this.idleAgent=null;this.idleTimer=null;this.idleTask=null;this.pendingTurnEnds=new Map();this.postTurnAgents=new Map();this.postTurnBusyRetries=new Map();this.postTurnRetryAt=new Map();this.postTurnTimer=null;this.postTurnTask=null;this.postTurnAbort=null;this.postTurnAgent=null;this.postTurnStatus='尚未执行';this.warmed=new Map();this.warmStats={attempts:0,prepared:0,hits:0,leafRequests:0,leafHits:0,failures:0,cancelled:0,lastState:'未开始',lastError:'',lastAt:0,lastThreshold:0,lastTrigger:0,lastHeadroom:0};
   ctx.inject(['losslessContext'],scope=>{
    const owner=scope.losslessContext;this.settings=owner;owner.engines.add(this);
    const update=()=>{this.warmed.clear();this.idleAbort?.abort();this.postTurnAbort?.abort();const value=nativeConfig(owner.configFile.value);if(this.summaryAborts.size)this.pendingConfig=value;else this.config=value;};update();
    const unsubscribe=owner.configFile.subscribe(update),recall=installRecall(scope,()=>this.settings?.index,()=>this.settings?.configFile.value);
    scope.effect(()=>()=>{unsubscribe();recall?.dispose?.();owner.engines.delete(this);this.abortSummary();if(this.settings===owner)this.settings=null;});
   });
-  ctx.on('session/event',(session,event)=>{if(event.type!=='turn/end'||!Number.isSafeInteger(event.seq)||!this.settings?.configFile.value.enabled||!this.settings.configFile.value.automatic||this.settings.configFile.value.compressionTiming!=='after-turn')return;this.postTurnBusyRetries.delete(session.id);this.pendingTurnEnds.set(session.id,event.seq);if(this.pendingTurnEnds.size>500)this.pendingTurnEnds.delete(this.pendingTurnEnds.keys().next().value);const agent=ctx.get('agents')?.get(session.id);if(agent?.status==='idle')this.queuePostTurn(agent);});
-  ctx.on('agent/status',({agent,status})=>{if(status!=='idle')return;if(this.pendingTurnEnds.has(agent.session.id)&&this.settings?.configFile.value.compressionTiming==='after-turn'){this.queuePostTurn(agent);return;}if(this.idleTimer||this.idleTask||this.postTurnTimer||this.postTurnTask||!this.settings?.configFile.value.deferred)return;this.idleTimer=setTimeout(()=>{this.idleTimer=null;const owner=this.settings,task=this.idleMaintenance(agent).catch(error=>{if(error?.name==='AbortError'||error?.code==='ABORT_ERR'){this.warmStats.cancelled++;this.warmStats.lastState='已取消';return;}this.warmStats.failures++;this.warmStats.lastState='失败';this.warmStats.lastError=String(error?.code||error?.name||'unknown').slice(0,96);});this.idleTask=task;owner?.tasks.add(task);task.finally(()=>{owner?.tasks.delete(task);if(this.idleTask===task)this.idleTask=null;});},100);this.idleTimer.unref?.();});
-  ctx.on('agent/inbox/inserted',({agent})=>{if(this.idleAgent?.session.id===agent.session.id)this.idleAbort?.abort();if(this.postTurnAgent?.session.id===agent.session.id)this.postTurnAbort?.abort();});
-  ctx.effect(()=>async()=>{clearTimeout(this.idleTimer);clearTimeout(this.postTurnTimer);this.abortSummary();await Promise.allSettled([this.idleTask,this.postTurnTask].filter(Boolean));this.pendingTurnEnds.clear();this.postTurnBusyRetries.clear();});
+  ctx.on('session/event',(session,event)=>{if(event.type!=='turn/end'||!Number.isSafeInteger(event.seq)||!this.settings?.configFile.value.enabled||!this.settings.configFile.value.automatic||this.settings.configFile.value.compressionTiming!=='after-turn')return;this.postTurnBusyRetries.delete(session.id);this.postTurnRetryAt?.delete(session.id);this.pendingTurnEnds.set(session.id,event.seq);if(this.pendingTurnEnds.size>500){const oldest=this.pendingTurnEnds.keys().next().value;this.pendingTurnEnds.delete(oldest);this.postTurnAgents?.delete(oldest);}const agent=ctx.get('agents')?.get(session.id);if(agent)this.queuePostTurn(agent);});
+  ctx.on('agent/status',({agent,status})=>{if(status!=='idle')return;if(this.pendingTurnEnds.has(agent.session.id)&&this.settings?.configFile.value.compressionTiming==='after-turn'){this.queuePostTurn(agent);return;}if(this.pendingTurnEnds.size||this.idleTimer||this.idleTask||this.postTurnTimer||this.postTurnTask||!this.settings?.configFile.value.deferred)return;this.idleTimer=setTimeout(()=>{this.idleTimer=null;const owner=this.settings,task=this.idleMaintenance(agent).catch(error=>{if(error?.name==='AbortError'||error?.code==='ABORT_ERR'){this.warmStats.cancelled++;this.warmStats.lastState='已取消';return;}this.warmStats.failures++;this.warmStats.lastState='失败';this.warmStats.lastError=String(error?.code||error?.name||'unknown').slice(0,96);});this.idleTask=task;owner?.tasks.add(task);task.finally(()=>{owner?.tasks.delete(task);if(this.idleTask===task)this.idleTask=null;});},100);this.idleTimer.unref?.();});
+  // Native maintenance owns admission: new messages queue behind a running compaction.
+  // Only speculative warming is preemptible; never abort committed post-turn work.
+  ctx.on('agent/inbox/inserted',({agent})=>{if(this.idleAgent?.session.id===agent.session.id)this.idleAbort?.abort();});
+  ctx.effect(()=>async()=>{clearTimeout(this.idleTimer);clearTimeout(this.postTurnTimer);this.abortSummary();await Promise.allSettled([this.idleTask,this.postTurnTask].filter(Boolean));this.pendingTurnEnds.clear();this.postTurnAgents?.clear();this.postTurnRetryAt?.clear();this.postTurnBusyRetries.clear();});
  }
  abortSummary(){for(const abort of this.summaryAborts)abort.abort();this.idleAbort?.abort();this.postTurnAbort?.abort();}
  diagnostics(event,level='info',data={}){this.ctx.get('pluginDiagnostics')?.record('dsh-lossless-context',level,event,data);}
@@ -48,43 +61,84 @@ export default class LosslessCompaction extends BasicCompactionEngine {
   return BasicCompactionEngine.prototype.compactIfNeeded.call(scoped,agent,trigger,signal);
  }
  queuePostTurn(agent,delayMs=150){
-  this.postTurnBusyRetries??=new Map();
   const value=this.settings?.configFile.value;
   if(!value?.enabled||!value.automatic||value.compressionTiming!=='after-turn'||!this.pendingTurnEnds.has(agent.session.id))return;
-  if(this.postTurnTask||this.postTurnTimer||agent.status!=='idle'||agent.inbox?.hasPending)return;
+  this.postTurnAgents??=new Map();
+  this.postTurnBusyRetries??=new Map();
+  this.postTurnRetryAt??=new Map();
+  this.postTurnAgents.set(agent.session.id,agent);
   if(this.idleTimer){clearTimeout(this.idleTimer);this.idleTimer=null;}
-  if(this.idleTask){this.idleAbort?.abort();void this.idleTask.finally(()=>this.queuePostTurn(agent));return;}
-  this.postTurnTimer=setTimeout(()=>{
-   this.postTurnTimer=null;
-   if(agent.status!=='idle'||agent.inbox?.hasPending||!this.pendingTurnEnds.has(agent.session.id))return;
-   const turnSeq=this.pendingTurnEnds.get(agent.session.id);
-   this.pendingTurnEnds.delete(agent.session.id);
-   const abort=new AbortController(),owner=this.settings;this.postTurnAbort=abort;this.postTurnAgent=agent;
-   const task=this.runPostTurn(agent,abort.signal).catch(error=>{
-    if(abort.signal.aborted||error?.code==='cancelled'||error?.name==='AbortError'){this.postTurnStatus='新消息到达，已取消后台压缩';return;}
-    const code=String(error?.code||error?.name||'UNKNOWN').slice(0,64);
-    const attempts=this.postTurnBusyRetries.get(agent.session.id)??0;
-    if(code.toLowerCase()==='busy'&&attempts<3){
-     this.postTurnBusyRetries.set(agent.session.id,attempts+1);
-     if(!this.pendingTurnEnds.has(agent.session.id))this.pendingTurnEnds.set(agent.session.id,turnSeq);
-     this.postTurnStatus='原生维护事务暂忙，等待下一次空闲重试';
-     this.diagnostics('compression.deferred-busy-retry','warn',{attempt:attempts+1});
-     return;
-    }
-    this.postTurnBusyRetries.delete(agent.session.id);
-    this.postTurnStatus='后台压缩失败：'+code;
-    this.diagnostics('compression.deferred-failed','error',{code});
-   }).finally(()=>{
-    owner?.tasks.delete(task);if(this.postTurnTask===task)this.postTurnTask=null;
-    if(this.postTurnAbort===abort){this.postTurnAbort=null;this.postTurnAgent=null;}
-    if(this.pendingTurnEnds.has(agent.session.id)&&agent.status==='idle'){
-     const retries=this.postTurnBusyRetries.get(agent.session.id)??0;
-     this.queuePostTurn(agent,retries?Math.min(1200*2**(retries-1),4800):150);
-    }else if(!this.pendingTurnEnds.has(agent.session.id))this.postTurnBusyRetries.delete(agent.session.id);
-   });
-   this.postTurnTask=task;owner?.tasks.add(task);
-  },delayMs);
+  if(this.idleTask){this.idleAbort?.abort();void this.idleTask.finally(()=>this.schedulePostTurns());return;}
+  this.schedulePostTurns(delayMs);
+ }
+ /** Do not confuse the public idle status with the private maintenance phase.
+  * A busy maintenance lease is not an error: keep the turn queued until the
+  * agent transitions to idle (with a slow bounded fallback wakeup).
+  */
+ schedulePostTurns(delayMs=150){
+  if(this.postTurnTask||this.postTurnTimer||!this.pendingTurnEnds?.size)return;
+  this.postTurnTimer=setTimeout(()=>{this.postTurnTimer=null;this.startPendingPostTurn();},delayMs);
   this.postTurnTimer.unref?.();
+ }
+ startPendingPostTurn(){
+  if(this.postTurnTask)return;
+  if(this.idleTask){this.idleAbort?.abort();void this.idleTask.finally(()=>this.schedulePostTurns());return;}
+  this.postTurnAgents??=new Map();
+  this.postTurnRetryAt??=new Map();
+  this.postTurnBusyRetries??=new Map();
+  const now=Date.now();
+  let agent=null,turnSeq=null;
+  let waitMs=Infinity;
+  for(const [id,seq] of this.pendingTurnEnds){
+   const candidate=this.postTurnAgents.get(id);
+   if(!candidate)continue;
+   // Runtime reports maintenance as "idle"; the native lease only accepts
+   // phase.kind === idle. Keep the work pending rather than racing the lease.
+   if(candidate.status!=='idle'||candidate.inbox?.hasPending)continue;
+   if(candidate.phase?.kind&&candidate.phase.kind!=='idle'){
+    waitMs=Math.min(waitMs,3000);continue;
+   }
+   const retryAt=this.postTurnRetryAt.get(id)??0;
+   if(retryAt>now){waitMs=Math.min(waitMs,retryAt-now);continue;}
+   agent=candidate;turnSeq=seq;break;
+  }
+  if(!agent){if(Number.isFinite(waitMs))this.schedulePostTurns(Math.max(100,waitMs));return;}
+  const id=agent.session.id;
+  this.pendingTurnEnds.delete(id);
+  this.postTurnAgents.delete(id);
+  const abort=new AbortController(),owner=this.settings;
+  this.postTurnAbort=abort;this.postTurnAgent=agent;
+  const task=this.runPostTurn(agent,abort.signal).then(()=>{
+   this.postTurnBusyRetries.delete(id);this.postTurnRetryAt.delete(id);
+  }).catch(error=>{
+   if(abort.signal.aborted||error?.code==='cancelled'||error?.name==='AbortError'){
+    this.postTurnStatus='后台压缩已取消';
+    // Native maintenance cancellation on new work is handled by the next turn/end.
+    return;
+   }
+   const code=String(error?.code||error?.name||'UNKNOWN').slice(0,64);
+   if(code.toLowerCase()==='busy'){
+    const attempts=(this.postTurnBusyRetries.get(id)??0)+1;
+    this.postTurnBusyRetries.set(id,attempts);
+    const backoff=Math.min(500*Math.pow(2,Math.min(attempts-1,4)),8000);
+    this.postTurnRetryAt.set(id,Date.now()+backoff);
+    if(!this.pendingTurnEnds.has(id))this.pendingTurnEnds.set(id,turnSeq);
+    this.postTurnAgents.set(id,agent);
+    this.postTurnStatus='原生维护事务暂忙，等待空闲后压缩';
+    this.diagnostics('compression.deferred-busy-retry','warn',{count:attempts,durationMs:backoff});
+    return;
+   }
+   this.postTurnBusyRetries.delete(id);this.postTurnRetryAt.delete(id);
+   this.postTurnStatus='后台压缩失败：'+code;
+   this.diagnostics('compression.deferred-failed','error',{code});
+  }).finally(()=>{
+   owner?.tasks.delete(task);
+   if(this.postTurnTask===task)this.postTurnTask=null;
+   if(this.postTurnAbort===abort){this.postTurnAbort=null;this.postTurnAgent=null;}
+   // Drain every pending session, not just the session that just finished.
+   this.schedulePostTurns();
+  });
+  this.postTurnTask=task;owner?.tasks.add(task);
  }
  async runPostTurn(agent,signal){
   signal.throwIfAborted();
@@ -104,7 +158,7 @@ export default class LosslessCompaction extends BasicCompactionEngine {
   else this.postTurnStatus='没有可安全压缩的完整片段';
  }
  async idleMaintenance(agent){
-  const settings=this.settings,value=settings?.configFile.value;if(!settings?.index||!value.enabled||!value.automatic||!value.deferred||this.idleAbort||this.postTurnTask||this.postTurnTimer||this.pendingTurnEnds.has(agent.session.id)||agent.status!=='idle'||agent.inbox.hasPending)return;
+  const settings=this.settings,value=settings?.configFile.value;if(!settings?.index||!value.enabled||!value.automatic||!value.deferred||this.idleAbort||this.postTurnTask||this.postTurnTimer||this.pendingTurnEnds.size||agent.status!=='idle'||(agent.phase?.kind&&agent.phase.kind!=='idle')||agent.inbox.hasPending)return;
   const measurement=this.ctx.tokenMeter.measure(agent.session);if(measurement.totalTokens<4096)return;
   const config=agent.session.requestHeader()?.config;if(!config)return;
   const abort=new AbortController();this.idleAbort=abort;this.idleAgent=agent;
@@ -184,12 +238,12 @@ export default class LosslessCompaction extends BasicCompactionEngine {
   this.diagnostics('compression.started','info',{sessionId:agent.session.id,provider:agent.session.requestHeader()?.config?.provider,model:agent.session.requestHeader()?.config?.model,inputMessages:input.messages.length});
   let plan,available;
   try{({plan,available}=await this.prepare(input,agent,signal,value));}
-  catch(error){this.diagnostics('compression.failed','error',{stage:'prepare',code:error?.code||error?.name,error:String(error?.message||error)});throw error;}
+  catch(error){const code=summaryFailureCode(error);this.diagnostics('compression.failed','error',{code});this.diagnostics('compression.prepare-failed','error',{code});throw error;}
   const leaves=[];let ordinal=0;
   const run=async(payload,kind)=>{
    signal.throwIfAborted();const started=performance.now(),key=this.cacheKey(payload,agent,kind),cached=this.cached(key,agent.session.id);let result;
    try{result=cached?{...cached.result,usage:undefined,rawOutput:undefined,llmStreamCall:false}:await this.completeSummary(payload,agent,signal,value,metadata=>index.auxiliary(agent.session.id,compactionId,ordinal++,'truncated',metadata),kind);}
-   catch(error){this.diagnostics('compression.failed','error',{stage:kind,code:error?.code||error?.name,error:String(error?.message||error)});throw error;}
+   catch(error){const code=summaryFailureCode(error);this.diagnostics('compression.failed','error',{code});this.diagnostics(kind==='condensed'?'compression.condensed-failed':'compression.leaf-failed','error',{code});throw error;}
    signal.throwIfAborted();if(kind==='leaf'){this.warmStats.leafRequests++;if(cached)this.warmStats.leafHits++;}if(cached)this.warmStats.hits++;index.auxiliary(agent.session.id,compactionId,ordinal++,kind,{provider:result.provider,model:result.model,maxTokens:result.maxTokens,usage:result.usage??null,cachedFrom:cached?.source??null,estimatedOutputTokens:this.ctx.tokenMeter.estimateMessage({role:'assistant',content:result.summary}),durationMs:Math.round(performance.now()-started)});if(!cached)this.remember(key,result,compactionId,agent.session.id);return result;
   };
   if(plan.groups.length===1){const result=await run(input,'leaf');index.plan(agent.session.id,compactionId,{leaves:[{start:0,end:plan.groups[0].end,summary:summaryText(result)}]});this.diagnostics('compression.completed','info',{durationMs:Math.round(performance.now()-compressionStarted),leafCount:1});return this.withRecallHint(result,value);}
