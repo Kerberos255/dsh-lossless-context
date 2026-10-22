@@ -48,6 +48,14 @@ Native session events
 
 The current session keeps its native record. Retrieval and expansion resolve back to original source events. Model/provider limits and existing policies control thresholds; unavailable model metadata causes a safe error instead of invented budgets.
 
+### Idle preparation
+
+When the deferred timing is enabled, an idle agent may summarise the next compactable segment **before** compaction is needed and keep the result in the summary cache. A later commit then reuses those results instead of calling the model again. The work is bounded: at most two model calls per idle pass, at most three passes per uninterrupted idle period, and it stops as soon as the agent receives a message.
+
+Preparation and commit share the same payload builders (`leafPayload`, `condensedPayload`, `groupLayer`), so a warmed cache entry always matches the key the commit computes. A summary layer that cannot shrink is reported as `lcm-condensed-summary-does-not-fit` and ends the pass instead of retrying the same request.
+
+Diagnostics separate the two sources of cache hits: `warm.completed` reports `cacheHits`/`warmHits` for idle preparation, while `compression.completed` reports `cacheHits`/`modelCalls`/`modelMs` for the commit itself.
+
 ## Safety, storage, and tests
 
 The plugin stores **derived indexes** under DSH's data directory, not a second complete conversation history. Invalid, cancelled, oversized or truncated summaries are not committed. Private-channel auto-rotation requires verified owner/workspace bindings and completed Dream evidence; ordinary desktop/group/unverified sessions are not silently moved.

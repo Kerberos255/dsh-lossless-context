@@ -6,6 +6,7 @@ import { schema,nativeConfig } from '../config.js';
 import { deferredPressureBudget,retainedTailTokens } from '../pressure.js';
 import { summarizeComplete } from '../summarizer.js';
 import LosslessCompaction from '../agent.js';
+import { readShared, skipWithoutShared } from './shared-settings.mjs';
 
 const defaults=schema.defaults;
 const makeAgent=()=>({status:'idle',inbox:{hasPending:false},session:{id:'test-session',requestHeader:()=>({config:{provider:'test',model:'summary',maxTokens:4096}})},options:{}});
@@ -110,9 +111,10 @@ test('explicit user cancellation stops without retrying',async()=>{
  assert.equal(calls,1);
 });
 
-test('settings UI exposes compaction timing and bounded transport controls',()=>{
- const client=fs.readFileSync(new URL('../client.js',import.meta.url),'utf8');
- for(const name of ['compressionTiming','compressionTimeoutMs','compressionMaxRetries','postTurnStatus'])assert(client.includes(name));
+test('settings UI exposes compaction timing and bounded transport controls',{skip:skipWithoutShared},()=>{
+ const pages=JSON.parse(readShared('pages.json'));
+ const keys=pages['dsh-lossless-context'].fields.map(x=>x.key);
+ for(const name of ['compressionTiming','compressionTimeoutMs','compressionMaxRetries','postTurnStatus'])assert(keys.includes(name));
 });
 
 test('idle and in-turn compaction share the same tail retention policy',()=>{
@@ -163,4 +165,24 @@ test('post-turn busy native maintenance is retried after idle instead of discard
  assert.equal(engine.postTurnBusyRetries.size,0);
  assert.equal(engine.settings.tasks.size,0);
  assert(events.includes('compression.deferred-busy-retry'));
+});
+
+
+test('idle prewarm schedules at most three batches until the next inbox cycle',()=>{
+ const engine=Object.create(LosslessCompaction.prototype),agent=makeAgent();
+ engine.settings={configFile:{value:{enabled:true,automatic:true,deferred:true}},tasks:new Set()};
+ engine.pendingTurnEnds=new Map();engine.warmCampaigns=new Map();
+ engine.idleTimer=null;engine.idleTask=null;engine.postTurnTimer=null;engine.postTurnTask=null;
+ for(let i=0;i<3;i++){
+  engine.scheduleIdleWarm(agent,5000);
+  assert.equal(engine.warmCampaigns.get(agent.session.id),i+1);
+  assert(engine.idleTimer);
+  clearTimeout(engine.idleTimer);engine.idleTimer=null;
+ }
+ engine.scheduleIdleWarm(agent,5000);
+ assert.equal(engine.idleTimer,null,'the fourth idle batch is not scheduled');
+ engine.warmCampaigns.delete(agent.session.id); // new inbox permits another campaign
+ engine.scheduleIdleWarm(agent,5000);
+ assert.equal(engine.warmCampaigns.get(agent.session.id),1);
+ clearTimeout(engine.idleTimer);
 });

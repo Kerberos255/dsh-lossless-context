@@ -2,12 +2,13 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import vm from 'node:vm';
+import { readShared, skipWithoutShared } from './shared-settings.mjs';
 
 const read = relative => fs.readFileSync(new URL(relative, import.meta.url), 'utf8');
 const configExample = JSON.parse(read('../config.example.json'));
 
-test('summary model uses one DSH chat-model selector with a session-following default', () => {
-  const fields = JSON.parse(read("../tools/settings/pages.json"))['dsh-lossless-context'].fields;
+test('summary model uses one DSH chat-model selector with a session-following default', { skip: skipWithoutShared }, async () => {
+  const fields = JSON.parse(readShared('pages.json'))['dsh-lossless-context'].fields;
   const summaryFields = fields.filter(field => field.key.startsWith('summaryModel.') || ['summarizationProvider', 'summarizationModel'].includes(field.key));
   assert.equal(summaryFields.length, 1, 'provider ID must not be rendered as a separate input');
   const [model] = summaryFields;
@@ -23,8 +24,8 @@ test('summary model uses one DSH chat-model selector with a session-following de
   assert(!Object.hasOwn(configExample,'summarizationModel'));
 });
 
-test('native model picker offers a session-following entry and preserves specified provider/model', () => {
-  const snippet = read("../tools/settings/settings-client.inc.js");
+test('native model picker offers a session-following entry and preserves specified provider/model', { skip: skipWithoutShared }, async () => {
+  const snippet = readShared('settings-client.inc.js');
   const start = snippet.indexOf('function ModelPicker(');
   const end = snippet.indexOf('function FileConfigPage(');
   assert(start !== -1 && end > start);
@@ -51,8 +52,8 @@ test('native model picker offers a session-following entry and preserves specifi
   assert(chosenSelect.children.some(node => node?.type==='option' && node?.children[0]?.includes('当前配置')));
 });
 
-test('selector edits one nested model object and runtime emits native IDs only at the boundary', () => {
-  const snippet = read("../tools/settings/settings-client.inc.js");
+test('selector edits one nested model object and runtime emits native IDs only at the boundary', { skip: skipWithoutShared }, async () => {
+  const snippet = readShared('settings-client.inc.js');
   assert(snippet.includes("scope.call('modelCatalog',{kind})"), 'model list must come from DSH model catalog');
   assert(snippet.includes('emptyLabel:spec.emptyLabel'), 'model selector must receive its custom fallback label');
   assert(snippet.includes('configChange(configChange(previous.draft,spec.providerKey,selection.provider),spec.key,selection.model)'),

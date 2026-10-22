@@ -19,26 +19,78 @@ export function summaryFailureCode(error){
 }
 
 /** Preset-scoped native backend; all surface commits and replay stay native. */
+// Both the idle preparation and the committed compaction must build byte-identical
+// payloads, otherwise the warmed cache key never matches and the preparation is
+// silently wasted. These helpers are the single source of truth for that shape.
+export const condensedLabel = texts => texts.map((text, index) => `摘要 ${index + 1}:\n${text}`).join('\n\n');
+const systemFirst = (plan, rest) => [...(plan?.system ? [plan.system] : []), ...rest];
+export const leafPayload = (input, plan, group) =>
+  plan.groups.length === 1 ? input : { ...input, messages: systemFirst(plan, group.messages) };
+export const condensedPayload = (input, plan, texts) =>
+  ({ ...input, messages: systemFirst(plan, [{ role: 'user', content: [{ type: 'text', text: condensedLabel(texts) }] }]) });
+/** Group one summary layer by fanout and the remaining token budget. */
+export const groupLayer = (layer, { fanout, available, estimate }) => {
+  const groups = [];
+  for (let start = 0; start < layer.length;) {
+    const group = [];
+    let tokens = 0;
+    while (start < layer.length && group.length < fanout) {
+      const candidate = layer[start], cost = estimate(candidate);
+      if (group.length && tokens + cost > available) break;
+      group.push(candidate); tokens += cost; start++;
+    }
+    groups.push(group);
+  }
+  return groups;
+};
+/** A layer that cannot shrink is a structural stop, not a transient model failure. */
+export const notFitError = () => Object.assign(new Error('condensed summary does not shrink the layer'), { code: 'lcm-condensed-summary-does-not-fit' });
+
 export default class LosslessCompaction extends BasicCompactionEngine {
  static inject=BasicCompactionEngine.inject;
  constructor(ctx,config={}){
   const settings=ctx.get('losslessContext');super(ctx,settings?nativeConfig(settings.configFile.value):config);
-  this.settings=null;this.pendingConfig=null;this.summaryAborts=new Set();this.idleAbort=null;this.idleAgent=null;this.idleTimer=null;this.idleTask=null;this.pendingTurnEnds=new Map();this.postTurnAgents=new Map();this.postTurnBusyRetries=new Map();this.postTurnRetryAt=new Map();this.postTurnTimer=null;this.postTurnTask=null;this.postTurnAbort=null;this.postTurnAgent=null;this.postTurnStatus='尚未执行';this.warmed=new Map();this.warmStats={attempts:0,prepared:0,hits:0,leafRequests:0,leafHits:0,failures:0,cancelled:0,lastState:'未开始',lastError:'',lastAt:0,lastThreshold:0,lastTrigger:0,lastHeadroom:0};
+  this.settings=null;this.pendingConfig=null;this.summaryAborts=new Set();this.idleAbort=null;this.idleAgent=null;this.idleTimer=null;this.idleTask=null;this.warmContinuation=null;this.warmCampaigns=new Map();this.pendingTurnEnds=new Map();this.postTurnAgents=new Map();this.postTurnBusyRetries=new Map();this.postTurnRetryAt=new Map();this.postTurnTimer=null;this.postTurnTask=null;this.postTurnAbort=null;this.postTurnAgent=null;this.postTurnStatus='尚未执行';this.warmed=new Map();this.warmStats={attempts:0,prepared:0,hits:0,leafRequests:0,leafHits:0,failures:0,cancelled:0,lastState:'未开始',lastError:'',lastAt:0,lastThreshold:0,lastTrigger:0,lastHeadroom:0,warmHits:0};
   ctx.inject(['losslessContext'],scope=>{
    const owner=scope.losslessContext;this.settings=owner;owner.engines.add(this);
-   const update=()=>{this.warmed.clear();this.idleAbort?.abort();this.postTurnAbort?.abort();const value=nativeConfig(owner.configFile.value);if(this.summaryAborts.size)this.pendingConfig=value;else this.config=value;};update();
+   const update=()=>{this.warmed.clear();this.warmContinuation=null;this.warmCampaigns.clear();clearTimeout(this.idleTimer);this.idleTimer=null;this.idleAbort?.abort();this.postTurnAbort?.abort();const value=nativeConfig(owner.configFile.value);if(this.summaryAborts.size)this.pendingConfig=value;else this.config=value;};update();
    const unsubscribe=owner.configFile.subscribe(update),recall=installRecall(scope,()=>this.settings?.index,()=>this.settings?.configFile.value);
    scope.effect(()=>()=>{unsubscribe();recall?.dispose?.();owner.engines.delete(this);this.abortSummary();if(this.settings===owner)this.settings=null;});
   });
   ctx.on('session/event',(session,event)=>{if(event.type!=='turn/end'||!Number.isSafeInteger(event.seq)||!this.settings?.configFile.value.enabled||!this.settings.configFile.value.automatic||this.settings.configFile.value.compressionTiming!=='after-turn')return;this.postTurnBusyRetries.delete(session.id);this.postTurnRetryAt?.delete(session.id);this.pendingTurnEnds.set(session.id,event.seq);if(this.pendingTurnEnds.size>500){const oldest=this.pendingTurnEnds.keys().next().value;this.pendingTurnEnds.delete(oldest);this.postTurnAgents?.delete(oldest);}const agent=ctx.get('agents')?.get(session.id);if(agent)this.queuePostTurn(agent);});
-  ctx.on('agent/status',({agent,status})=>{if(status!=='idle')return;if(this.pendingTurnEnds.has(agent.session.id)&&this.settings?.configFile.value.compressionTiming==='after-turn'){this.queuePostTurn(agent);return;}if(this.pendingTurnEnds.size||this.idleTimer||this.idleTask||this.postTurnTimer||this.postTurnTask||!this.settings?.configFile.value.deferred)return;this.idleTimer=setTimeout(()=>{this.idleTimer=null;const owner=this.settings,task=this.idleMaintenance(agent).catch(error=>{if(error?.name==='AbortError'||error?.code==='ABORT_ERR'){this.warmStats.cancelled++;this.warmStats.lastState='已取消';return;}this.warmStats.failures++;this.warmStats.lastState='失败';this.warmStats.lastError=String(error?.code||error?.name||'unknown').slice(0,96);});this.idleTask=task;owner?.tasks.add(task);task.finally(()=>{owner?.tasks.delete(task);if(this.idleTask===task)this.idleTask=null;});},100);this.idleTimer.unref?.();});
+  ctx.on('agent/status',({agent,status})=>{if(status!=='idle'||!agent?.session)return;if(this.pendingTurnEnds.has(agent.session.id)&&this.settings?.configFile.value.compressionTiming==='after-turn'){this.queuePostTurn(agent);return;}this.scheduleIdleWarm(agent);});
   // Native maintenance owns admission: new messages queue behind a running compaction.
   // Only speculative warming is preemptible; never abort committed post-turn work.
-  ctx.on('agent/inbox/inserted',({agent})=>{if(this.idleAgent?.session.id===agent.session.id)this.idleAbort?.abort();});
+  ctx.on('agent/inbox/inserted',({agent})=>{if(this.idleTimer){clearTimeout(this.idleTimer);this.idleTimer=null;}if(this.warmContinuation?.session?.id===agent.session.id)this.warmContinuation=null;this.warmCampaigns.delete(agent.session.id);if(this.idleAgent?.session.id===agent.session.id)this.idleAbort?.abort();});
   ctx.effect(()=>async()=>{clearTimeout(this.idleTimer);clearTimeout(this.postTurnTimer);this.abortSummary();await Promise.allSettled([this.idleTask,this.postTurnTask].filter(Boolean));this.pendingTurnEnds.clear();this.postTurnAgents?.clear();this.postTurnRetryAt?.clear();this.postTurnBusyRetries.clear();});
  }
  abortSummary(){for(const abort of this.summaryAborts)abort.abort();this.idleAbort?.abort();this.postTurnAbort?.abort();}
  diagnostics(event,level='info',data={}){this.ctx.get('pluginDiagnostics')?.record('dsh-lossless-context',level,event,data);}
+
+ scheduleIdleWarm(agent,delayMs=100){
+  const value=this.settings?.configFile.value;
+  if(!value?.enabled||!value.automatic||!value.deferred||!agent||agent.status!=='idle'||agent.inbox?.hasPending||this.pendingTurnEnds.size||this.idleTimer||this.idleTask||this.postTurnTimer||this.postTurnTask)return;
+  const sessionId=agent.session.id,attempts=this.warmCampaigns.get(sessionId)??0;
+  if(attempts>=3)return; // At most six summary nodes per uninterrupted idle period.
+  this.warmCampaigns.set(sessionId,attempts+1);
+  if(this.warmCampaigns.size>256)this.warmCampaigns.delete(this.warmCampaigns.keys().next().value);
+  this.idleTimer=setTimeout(()=>{
+   this.idleTimer=null;
+   const owner=this.settings;
+   const task=this.idleMaintenance(agent).then(pending=>{if(pending)this.warmContinuation=agent;}).catch(error=>{
+    if(error?.name==='AbortError'||error?.code==='ABORT_ERR'){this.warmStats.cancelled++;this.warmStats.lastState='已取消';return;}
+    this.warmStats.failures++;this.warmStats.lastState='失败';this.warmStats.lastError=String(error?.code||error?.name||'unknown').slice(0,96);
+   });
+   this.idleTask=task;owner?.tasks.add(task);
+   void task.finally(()=>{
+    owner?.tasks.delete(task);
+    if(this.idleTask===task)this.idleTask=null;
+    if(this.warmContinuation===agent){this.warmContinuation=null;this.scheduleIdleWarm(agent,1200);}
+   });
+  },delayMs);
+  this.idleTimer.unref?.();
+ }
+
 
  async compactIfNeeded(agent,trigger,signal){
   const value=this.settings?.configFile.value;
@@ -157,34 +209,84 @@ export default class LosslessCompaction extends BasicCompactionEngine {
   if(result){this.postTurnStatus='任务结束后已完成压缩';this.diagnostics('compression.deferred-completed','info',{durationMs:Math.round(performance.now()-started)});}
   else this.postTurnStatus='没有可安全压缩的完整片段';
  }
- async idleMaintenance(agent){
-  const settings=this.settings,value=settings?.configFile.value;if(!settings?.index||!value.enabled||!value.automatic||!value.deferred||this.idleAbort||this.postTurnTask||this.postTurnTimer||this.pendingTurnEnds.size||agent.status!=='idle'||(agent.phase?.kind&&agent.phase.kind!=='idle')||agent.inbox.hasPending)return;
-  const measurement=this.ctx.tokenMeter.measure(agent.session);if(measurement.totalTokens<4096)return;
-  const config=agent.session.requestHeader()?.config;if(!config)return;
-  const abort=new AbortController();this.idleAbort=abort;this.idleAgent=agent;
-  try{await agent.runMaintenance(async nativeSignal=>{
-   const signal=AbortSignal.any([nativeSignal,abort.signal]),info=await this.ctx.llm.resolveModelInfo(config.provider,config.model,signal);if(!info.context)return;
-   const override=this.config.modelPolicies.find(policy=>policy.provider===config.provider&&policy.model===config.model)??{};
-   const window=info.context.contextWindow,output=config.maxTokens??info.defaultMaxTokens??0;
-   const budget=warmBudget({window,output,thresholdRatio:this.config.thresholdRatio,headroomTokens:value.headroomTokens,headroomMode:value.headroomMode,override,deferredRatio:value.deferredRatio,leafChunkTokens:value.leafChunkTokens});
-   this.warmStats.lastThreshold=budget.threshold;this.warmStats.lastTrigger=budget.trigger;this.warmStats.lastHeadroom=budget.safety;
-   if(budget.threshold<=0||budget.trigger<=0){this.warmStats.lastState='模型窗口余量不足';return;}
-   if(measurement.totalTokens<budget.trigger){this.warmStats.lastState='等待提前预备';return;}
-   this.warmStats.attempts++;this.warmStats.lastAt=Date.now();this.warmStats.lastState='正在预备';this.warmStats.lastError='';
-   const retain=retainedTailTokens({window,output,config:this.config,override});
-   const nodes=agent.session.surface.nodes,first=agent.session.deriveEventMessage(agent.session.eventAt(nodes[0]))?.role==='system'?1:0;let from=nodes.length,kept=0;
-   for(let i=nodes.length-1;i>=first;i--){from=i;kept+=measurement.nodes[i].tokens;if(kept>=retain)break;}
-   while(from>first&&(!toolPairingBalancedBefore(agent.session,nodes[from])||!toolPairingBalancedAfter(agent.session,nodes[from-1])))from--;
-   if(from<=first){this.warmStats.lastState='旧上下文不足以预备';return;}
-   const system=first?agent.session.deriveEventMessage(agent.session.eventAt(nodes[0])):null,input={tools:agent.session.requestHeader()?.tools,messages:[...(system?[system]:[]),...nodes.slice(first,from).map(seq=>agent.session.deriveEventMessage(agent.session.eventAt(seq))).filter(Boolean)]};
-   const {plan}=await this.prepare(input,agent,signal,value),warmId='warm:'+randomUUID();let count=0,ordinal=0;
-   for(const group of plan.groups){if(count>=2)break;const payload=plan.groups.length===1?input:{...input,messages:[...(plan.system?[plan.system]:[]),...group.messages]},key=this.cacheKey(payload,agent,'leaf');if(this.cached(key,agent.session.id)){this.warmStats.hits++;continue;}
-    signal.throwIfAborted();const started=performance.now(),result=await this.completeSummary(payload,agent,signal,value,metadata=>settings.index.auxiliary(agent.session.id,warmId,ordinal++,'truncated',metadata),'leaf');signal.throwIfAborted();
-    settings.index.auxiliary(agent.session.id,warmId,ordinal++,'warm-leaf',{provider:result.provider,model:result.model,maxTokens:result.maxTokens,usage:result.usage??null,durationMs:Math.round(performance.now()-started),estimatedOutputTokens:this.ctx.tokenMeter.estimateMessage({role:'assistant',content:result.summary})});count++;this.remember(key,result,warmId,agent.session.id);
+
+ /** Prepare exactly the same leaf/condensed payloads as the native transaction, without committing. */
+ async warmPrepared(input,agent,signal,value,index,warmId,limit=2){
+  const {plan,available}=await this.prepare(input,agent,signal,value);
+  let prepared=0,cacheHits=0,ordinal=0;
+  const get=async(payload,kind)=>{
+   signal.throwIfAborted();
+   const key=this.cacheKey(payload,agent,kind),cached=this.cached(key,agent.session.id);
+   if(cached){cacheHits++;return cached.result;}
+   if(prepared>=limit)return null;
+   const started=performance.now();
+   const result=await this.completeSummary(payload,agent,signal,value,metadata=>index.auxiliary(agent.session.id,warmId,ordinal++,'truncated',metadata),kind);
+   signal.throwIfAborted();
+   const durationMs=Math.round(performance.now()-started);
+   index.auxiliary(agent.session.id,warmId,ordinal++,'warm-'+kind,{provider:result.provider,model:result.model,maxTokens:result.maxTokens,usage:result.usage??null,durationMs,estimatedOutputTokens:this.ctx.tokenMeter.estimateMessage({role:'assistant',content:result.summary})});
+   this.remember(key,result,warmId,agent.session.id);
+   this.diagnostics('warm.stage','info',{kind,durationMs});
+   prepared++;
+   return result;
+  };
+  const layer=[];
+  for(const group of plan.groups){
+   const result=await get(leafPayload(input,plan,group),'leaf');
+   if(!result)return {prepared,cacheHits,pending:true,leafCount:plan.groups.length};
+   layer.push({text:summaryText(result)});
+  }
+  if(layer.length<=1)return {prepared,cacheHits,pending:false,leafCount:layer.length};
+  const estimate=item=>this.ctx.tokenMeter.estimateMessage({role:'user',content:[{type:'text',text:item.text}]});
+  let current=layer;
+  while(current.length>1){
+   const next=[];
+   for(const group of groupLayer(current,{fanout:value.condenseFanout,available,estimate})){
+    if(group.length===1){next.push(group[0]);continue;}
+    const result=await get(condensedPayload(input,plan,group.map(item=>item.text)),'condensed');
+    if(!result)return {prepared,cacheHits,pending:true,leafCount:plan.groups.length};
+    next.push({text:summaryText(result)});
    }
-   this.warmStats.prepared+=count;this.warmStats.lastState=count?'已预备 '+count+' 个叶摘要':'缓存已命中或没有可预备片段';
-   this.diagnostics('warm.completed','info',{durationMs:Date.now()-this.warmStats.lastAt,prepared:count,cacheHits:this.warmStats.hits});
-  });}finally{if(this.idleAbort===abort){this.idleAbort=null;this.idleAgent=null;}}
+   if(next.length>=current.length){
+    this.diagnostics('warm.condensed-not-fit','warn',{layer:current.length,code:'lcm-condensed-summary-does-not-fit'});
+    return {prepared,cacheHits,pending:false,leafCount:plan.groups.length,stopped:'not-fit'};
+   }
+   current=next;
+  }
+  return {prepared,cacheHits,pending:false,leafCount:plan.groups.length};
+ }
+
+ async idleMaintenance(agent){
+  const settings=this.settings,value=settings?.configFile.value;
+  if(!settings?.index||!value.enabled||!value.automatic||!value.deferred||this.idleAbort||this.postTurnTask||this.postTurnTimer||this.pendingTurnEnds.size||agent.status!=='idle'||(agent.phase?.kind&&agent.phase.kind!=='idle')||agent.inbox.hasPending)return false;
+  const measurement=this.ctx.tokenMeter.measure(agent.session);if(measurement.totalTokens<4096)return false;
+  const config=agent.session.requestHeader()?.config;if(!config)return false;
+  const abort=new AbortController();this.idleAbort=abort;this.idleAgent=agent;
+  try{
+   return await agent.runMaintenance(async nativeSignal=>{
+    const signal=AbortSignal.any([nativeSignal,abort.signal]);
+    const info=await this.ctx.llm.resolveModelInfo(config.provider,config.model,signal);if(!info.context)return false;
+    const override=this.config.modelPolicies.find(policy=>policy.provider===config.provider&&policy.model===config.model)??{};
+    const window=info.context.contextWindow,output=config.maxTokens??info.defaultMaxTokens??0;
+    const budget=warmBudget({window,output,thresholdRatio:this.config.thresholdRatio,headroomTokens:value.headroomTokens,headroomMode:value.headroomMode,override,deferredRatio:value.deferredRatio,leafChunkTokens:value.leafChunkTokens});
+    this.warmStats.lastThreshold=budget.threshold;this.warmStats.lastTrigger=budget.trigger;this.warmStats.lastHeadroom=budget.safety;
+    if(budget.threshold<=0||budget.trigger<=0){this.warmStats.lastState='模型窗口余量不足';return false;}
+    if(measurement.totalTokens<budget.trigger){this.warmStats.lastState='等待提前预备';return false;}
+    this.warmStats.attempts++;this.warmStats.lastAt=Date.now();this.warmStats.lastState='正在预备';this.warmStats.lastError='';
+    const retain=retainedTailTokens({window,output,config:this.config,override});
+    const nodes=agent.session.surface.nodes,first=agent.session.deriveEventMessage(agent.session.eventAt(nodes[0]))?.role==='system'?1:0;let from=nodes.length,kept=0;
+    for(let i=nodes.length-1;i>=first;i--){from=i;kept+=measurement.nodes[i].tokens;if(kept>=retain)break;}
+    while(from>first&&(!toolPairingBalancedBefore(agent.session,nodes[from])||!toolPairingBalancedAfter(agent.session,nodes[from-1])))from--;
+    if(from<=first){this.warmStats.lastState='旧上下文不足以预备';return false;}
+    const system=first?agent.session.deriveEventMessage(agent.session.eventAt(nodes[0])):null;
+    const input={tools:agent.session.requestHeader()?.tools,messages:[...(system?[system]:[]),...nodes.slice(first,from).map(seq=>agent.session.deriveEventMessage(agent.session.eventAt(seq))).filter(Boolean)]};
+    const result=await this.warmPrepared(input,agent,signal,value,settings.index,'warm:'+randomUUID());
+    signal.throwIfAborted();
+    this.warmStats.prepared+=result.prepared;this.warmStats.warmHits+=result.cacheHits;
+    this.warmStats.lastState=result.stopped==='not-fit'?'摘要层无法再收缩，已停止预备':result.pending?'已预备 '+result.prepared+' 个，空闲时继续':'已完成当前可压缩片段的预备';
+    this.diagnostics('warm.completed','info',{durationMs:Date.now()-this.warmStats.lastAt,prepared:result.prepared,cacheHits:result.cacheHits,warmHits:this.warmStats.warmHits,stopped:result.stopped??null,pending:result.pending,leafCount:result.leafCount});
+    return result.pending&&result.prepared>0;
+   });
+  }finally{if(this.idleAbort===abort){this.idleAbort=null;this.idleAgent=null;}}
  }
  cacheKey(input,agent,kind='leaf'){
   const value=this.settings?.configFile.value;
@@ -239,27 +341,41 @@ export default class LosslessCompaction extends BasicCompactionEngine {
   let plan,available;
   try{({plan,available}=await this.prepare(input,agent,signal,value));}
   catch(error){const code=summaryFailureCode(error);this.diagnostics('compression.failed','error',{code});this.diagnostics('compression.prepare-failed','error',{code});throw error;}
+  const stage={prepareMs:Math.round(performance.now()-compressionStarted),leafCount:0,branchCount:0,cacheHits:0,modelCalls:0,modelMs:0};
+  this.diagnostics('compression.plan','info',{prepareMs:stage.prepareMs,leafCount:plan.groups.length,inputMessages:input.messages.length});
   const leaves=[];let ordinal=0;
   const run=async(payload,kind)=>{
    signal.throwIfAborted();const started=performance.now(),key=this.cacheKey(payload,agent,kind),cached=this.cached(key,agent.session.id);let result;
    try{result=cached?{...cached.result,usage:undefined,rawOutput:undefined,llmStreamCall:false}:await this.completeSummary(payload,agent,signal,value,metadata=>index.auxiliary(agent.session.id,compactionId,ordinal++,'truncated',metadata),kind);}
    catch(error){const code=summaryFailureCode(error);this.diagnostics('compression.failed','error',{code});this.diagnostics(kind==='condensed'?'compression.condensed-failed':'compression.leaf-failed','error',{code});throw error;}
-   signal.throwIfAborted();if(kind==='leaf'){this.warmStats.leafRequests++;if(cached)this.warmStats.leafHits++;}if(cached)this.warmStats.hits++;index.auxiliary(agent.session.id,compactionId,ordinal++,kind,{provider:result.provider,model:result.model,maxTokens:result.maxTokens,usage:result.usage??null,cachedFrom:cached?.source??null,estimatedOutputTokens:this.ctx.tokenMeter.estimateMessage({role:'assistant',content:result.summary}),durationMs:Math.round(performance.now()-started)});if(!cached)this.remember(key,result,compactionId,agent.session.id);return result;
+   signal.throwIfAborted();const durationMs=Math.round(performance.now()-started);
+   if(kind==='leaf'){stage.leafCount++;this.warmStats.leafRequests++;if(cached)this.warmStats.leafHits++;}else stage.branchCount++;
+   if(cached){stage.cacheHits++;this.warmStats.hits++;}else{stage.modelCalls++;stage.modelMs+=durationMs;}
+   index.auxiliary(agent.session.id,compactionId,ordinal++,kind,{provider:result.provider,model:result.model,maxTokens:result.maxTokens,usage:result.usage??null,cachedFrom:cached?.source??null,estimatedOutputTokens:this.ctx.tokenMeter.estimateMessage({role:'assistant',content:result.summary}),durationMs});
+   if(!cached)this.remember(key,result,compactionId,agent.session.id);
+   this.diagnostics('compression.stage','info',{kind,cacheHit:!!cached,durationMs});return result;
   };
-  if(plan.groups.length===1){const result=await run(input,'leaf');index.plan(agent.session.id,compactionId,{leaves:[{start:0,end:plan.groups[0].end,summary:summaryText(result)}]});this.diagnostics('compression.completed','info',{durationMs:Math.round(performance.now()-compressionStarted),leafCount:1});return this.withRecallHint(result,value);}
+  if(plan.groups.length===1){const result=await run(input,'leaf');index.plan(agent.session.id,compactionId,{leaves:[{start:0,end:plan.groups[0].end,summary:summaryText(result)}]});this.diagnostics('compression.completed','info',{durationMs:Math.round(performance.now()-compressionStarted),...stage});return this.withRecallHint(result,value);}
   for(const group of plan.groups){const result=await run({...input,messages:[...(plan.system?[plan.system]:[]),...group.messages]},'leaf');leaves.push({...group,messages:undefined,summary:summaryText(result),result});}
   const dag={leaves:leaves.map(({start,end,summary})=>({start,end,summary})),branches:[],rootChildren:[]};
   let layer=leaves.map((leaf,index)=>({id:'leaf:'+index,text:leaf.summary,result:leaf.result}));
+  const estimate=item=>this.ctx.tokenMeter.estimateMessage({role:'user',content:[{type:'text',text:item.text}]});
   while(layer.length>1){
-   const next=[];for(let start=0;start<layer.length;){
-    const group=[];let tokens=0;
-    while(start<layer.length&&group.length<value.condenseFanout){const candidate=layer[start],cost=this.ctx.tokenMeter.estimateMessage({role:'user',content:[{type:'text',text:candidate.text}]});if(group.length&&tokens+cost>available)break;group.push(candidate);tokens+=cost;start++;}
+   const next=[];
+   for(const group of groupLayer(layer,{fanout:value.condenseFanout,available,estimate})){
     if(group.length===1){next.push(group[0]);continue;}
-    const result=await run({...input,messages:[...(plan.system?[plan.system]:[]),{role:'user',content:[{type:'text',text:group.map((leaf,index)=>`摘要 ${index+1}:\n${leaf.text}`).join('\n\n')}]}]},'condensed');const id='branch:'+dag.branches.length,children=group.map(leaf=>leaf.id);dag.branches.push({id,children,summary:summaryText(result)});next.push({id,text:summaryText(result),result});
-   }if(next.length>=layer.length)throw new Error('lcm-condensed-summary-does-not-fit');layer=next;
+    const result=await run(condensedPayload(input,plan,group.map(item=>item.text)),'condensed');
+    const id='branch:'+dag.branches.length,children=group.map(leaf=>leaf.id);dag.branches.push({id,children,summary:summaryText(result)});next.push({id,text:summaryText(result),result});
+   }
+   if(next.length>=layer.length){
+    const error=notFitError();
+    this.diagnostics('compression.condensed-not-fit','error',{layer:layer.length,code:error.code});
+    throw error;
+   }
+   layer=next;
   }
   const root=dag.branches.pop();dag.rootChildren=root.children;index.plan(agent.session.id,compactionId,dag);
-  this.diagnostics('compression.completed','info',{sessionId:agent.session.id,durationMs:Math.round(performance.now()-compressionStarted),leafCount:plan.groups.length,branchCount:dag.branches.length+1});
+  this.diagnostics('compression.completed','info',{durationMs:Math.round(performance.now()-compressionStarted),...stage});
   const result=layer[0].result;
   return this.withRecallHint(result,value);
  }

@@ -140,3 +140,49 @@ test('failed multi-leaf compaction resumes complete leaves after restart without
   engine.settings.index.close();
  });
 }));
+
+
+test('idle prewarm resumes complete leaves and condensed root across restart; native commit reuses all calls',()=>withIndex(async file=>{
+ const messages=['alpha','beta','gamma'].map(text=>({role:'user',content:[{type:'text',text}]}));
+ const input={messages,tools:[]};
+ const value={...schema.defaults,condenseFanout:8};
+ const agent={session:{id:'warm-session',seq:0,requestHeader:()=>({config:{provider:'opencode-go',model:'deepseek-v4.1-flash'}})},options:{}};
+ const calls=[];
+ const make=()=>{
+  const index=new LosslessIndex(file);
+  index.sync=()=>{};index.active=()=> 'mock-active';index.auxiliary=()=>{};index.plan=()=>{};
+  const engine=Object.create(LosslessCompaction.prototype);
+  engine.config=nativeConfig(value);
+  engine.settings={index,configFile:{value}};
+  engine.warmed=new Map();engine.warmStats={leafRequests:0,leafHits:0,hits:0};
+  engine.ctx={tokenMeter:{estimateMessage:()=>40}};
+  const events=[];engine.diagnostics=(event,level,data)=>events.push({event,data});
+  engine.prepare=async()=>({available:200000,plan:{system:null,groups:messages.map((message,i)=>({messages:[message],tokens:40,start:i,end:i+1}))}});
+  engine.completeSummary=async (_payload,_agent,_signal,_value,_onTruncated,kind)=>{
+   calls.push(kind);
+   return sample(kind+' summary '+calls.length);
+  };
+  return {engine,index,events};
+ };
+ let {engine,index}=make();
+ const signal=new AbortController().signal;
+ const first=await engine.warmPrepared(input,agent,signal,value,index,'warm:one');
+ assert.equal(first.prepared,2);
+ assert.equal(first.pending,true);
+ assert.deepEqual(calls,['leaf','leaf']);
+ assert.equal(index.stats().cachedSummaries,2);
+ index.close();
+ ({engine,index}=make());
+ const second=await engine.warmPrepared(input,agent,signal,value,index,'warm:two');
+ assert.equal(second.prepared,2);
+ assert.equal(second.pending,false);
+ assert.deepEqual(calls,['leaf','leaf','leaf','condensed']);
+ const third=await engine.warmPrepared(input,agent,signal,value,index,'warm:three');
+ assert.equal(third.prepared,0);
+ assert.equal(third.pending,false);
+ const output=await engine.summarizeLossless(input,agent,signal,engine.settings,value);
+ assert.equal(output.summary[0].text,'condensed summary 4');
+ assert.equal(calls.length,4,'formal compression needs no additional model requests');
+ assert.equal(engine.warmStats.leafHits,3);
+ index.close();
+}));
