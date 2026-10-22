@@ -23,7 +23,7 @@ function queryTerms(query){
 /** Derived summaries, postings and immutable native references. No mirrored transcript. */
 export class LosslessIndex {
  constructor(filename,{maxIndexedChars=32768}={}){
-  this.maxIndexedChars=maxIndexedChars;this.closed=false;if(filename!==':memory:')mkdirSync(path.dirname(filename),{recursive:true});this.db=new DatabaseSync(filename);
+  this.maxIndexedChars=maxIndexedChars;this.closed=false;this.filesRoot=filename===':memory:'?null:path.join(path.dirname(filename),'lcm-files');if(filename!==':memory:')mkdirSync(path.dirname(filename),{recursive:true});this.db=new DatabaseSync(filename);
   this.db.exec(`PRAGMA journal_mode=WAL;PRAGMA synchronous=NORMAL;PRAGMA busy_timeout=3000;
    CREATE TABLE IF NOT EXISTS lcm_cursor(session_id TEXT PRIMARY KEY,next_seq INTEGER NOT NULL);
    CREATE TABLE IF NOT EXISTS lcm_refs(id INTEGER PRIMARY KEY,session_id TEXT NOT NULL,seq INTEGER NOT NULL,type TEXT NOT NULL,chars INTEGER NOT NULL,digest TEXT NOT NULL,index_truncated INTEGER NOT NULL,UNIQUE(session_id,seq));
@@ -34,7 +34,34 @@ export class LosslessIndex {
    CREATE TABLE IF NOT EXISTS lcm_aux_calls(session_id TEXT,id TEXT,ordinal INTEGER,kind TEXT,metadata TEXT,PRIMARY KEY(session_id,id,ordinal));
    CREATE TABLE IF NOT EXISTS lcm_summary_cache(session_id TEXT NOT NULL,cache_key TEXT NOT NULL,payload TEXT NOT NULL,digest TEXT NOT NULL,source TEXT NOT NULL,cached_at INTEGER NOT NULL,PRIMARY KEY(session_id,cache_key));
    CREATE INDEX IF NOT EXISTS lcm_summary_cache_age ON lcm_summary_cache(cached_at);
+   CREATE TABLE IF NOT EXISTS lcm_files(session_id TEXT NOT NULL,id TEXT NOT NULL,chars INTEGER NOT NULL,file_path TEXT NOT NULL,excerpt TEXT NOT NULL,created_at INTEGER NOT NULL,PRIMARY KEY(session_id,id));
+   CREATE INDEX IF NOT EXISTS lcm_files_session ON lcm_files(session_id,created_at DESC);
   `);
+ }
+ /** Where externalised large blocks live: next to the index, never inside it. */
+ fileDir(sessionId){
+  if(!this.filesRoot)throw new Error('lcm-files-unavailable');
+  const dir=path.join(this.filesRoot,sessionId);mkdirSync(dir,{recursive:true});return dir;
+ }
+ putFile({sessionId,id,chars,filePath,excerpt}){
+  if(this.closed)throw new Error('lcm-index-closed');
+  this.db.prepare('INSERT OR REPLACE INTO lcm_files(session_id,id,chars,file_path,excerpt,created_at) VALUES(?,?,?,?,?,?)')
+   .run(sessionId,id,chars,filePath,String(excerpt??'').slice(0,8192),Date.now());
+ }
+ file(sessionId,id){
+  const row=this.db.prepare('SELECT id,chars,file_path,excerpt,created_at FROM lcm_files WHERE session_id=? AND id=?').get(sessionId,id);
+  return row?{id:row.id,chars:row.chars,path:row.file_path,excerpt:row.excerpt,createdAt:row.created_at}:null;
+ }
+ files(sessionId,limit=20){
+  return this.db.prepare('SELECT id,chars,created_at FROM lcm_files WHERE session_id=? ORDER BY created_at DESC LIMIT ?').all(sessionId,limit)
+   .map(row=>({id:row.id,chars:row.chars,createdAt:row.created_at}));
+ }
+ searchFiles(sessionId,query,limit=10){
+  const needle=String(query??'').trim().slice(0,200);
+  if(!needle)return [];
+  return this.db.prepare("SELECT id,chars,excerpt FROM lcm_files WHERE session_id=? AND excerpt LIKE ? ESCAPE '\\' ORDER BY created_at DESC LIMIT ?")
+   .all(sessionId,'%'+needle.replaceAll('%','\\%').replaceAll('_','\\_')+'%',limit)
+   .map(row=>({id:row.id,chars:row.chars,excerpt:row.excerpt.slice(0,400)}));
  }
  tx(fn){this.db.exec('BEGIN IMMEDIATE');try{const result=fn();this.db.exec('COMMIT');return result;}catch(error){this.db.exec('ROLLBACK');throw error;}}
  cursor(sessionId){return this.db.prepare('SELECT next_seq FROM lcm_cursor WHERE session_id=?').get(sessionId)?.next_seq??0;}

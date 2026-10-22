@@ -28,6 +28,7 @@
   "recall": true,
   "promptAwareRecall": true,
   "maxRecallChars": 16000,
+  "largeFileCharsThreshold": 60000,
   "maxIndexedChars": 32768,
   "rotationMode": "auto",
   "rotationFileMiB": 20,

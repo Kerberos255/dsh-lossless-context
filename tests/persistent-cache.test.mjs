@@ -181,7 +181,8 @@ test('idle prewarm resumes complete leaves and condensed root across restart; na
  assert.equal(third.prepared,0);
  assert.equal(third.pending,false);
  const output=await engine.summarizeLossless(input,agent,signal,engine.settings,value);
- assert.equal(output.summary[0].text,'condensed summary 4');
+ assert.match(output.summary[0].text,/^<summary[^>]*kind="condensed"/);
+ assert.ok(output.summary[0].text.includes('condensed summary 4'),'summary text survives the envelope');
  assert.equal(calls.length,4,'formal compression needs no additional model requests');
  assert.equal(engine.warmStats.leafHits,3);
  index.close();

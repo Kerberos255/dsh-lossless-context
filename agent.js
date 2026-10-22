@@ -1,8 +1,10 @@
 import { BasicCompactionEngine } from './native/basic-compaction-rc2.js';
 import { toolPairingBalancedBefore, toolPairingBalancedAfter } from '@deepseek-ai/dsh-compaction';
 import { createHash, randomUUID } from 'node:crypto';
+import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import path from 'node:path';
 import { nativeConfig } from './config.js';
-import { leafPlan,summaryBudget,summaryText } from './planner.js';
+import { externalizeLargeBlocks,leafPlan,summaryBudget,summaryEnvelope,summaryText } from './planner.js';
 import { installRecall } from './recall.js';
 import { summarizeComplete } from './summarizer.js';
 import { warmBudget,scopedNativeConfig,deferredPressureBudget,retainedTailTokens } from './pressure.js';
@@ -212,7 +214,9 @@ export default class LosslessCompaction extends BasicCompactionEngine {
 
  /** Prepare exactly the same leaf/condensed payloads as the native transaction, without committing. */
  async warmPrepared(input,agent,signal,value,index,warmId,limit=2){
-  const {plan,available}=await this.prepare(input,agent,signal,value);
+  const preparedInput=await this.prepare(input,agent,signal,value);
+  const {plan,available}=preparedInput;
+  if(preparedInput.input)input=preparedInput.input;
   let prepared=0,cacheHits=0,ordinal=0;
   const get=async(payload,kind)=>{
    signal.throwIfAborted();
@@ -319,7 +323,31 @@ export default class LosslessCompaction extends BasicCompactionEngine {
   settings.tasks.add(operation);
   return operation.finally(()=>{const owner=this.rootEngine??this;settings.tasks.delete(operation);owner.summaryAborts.delete(abort);if(owner.pendingConfig&&!owner.summaryAborts.size){owner.config=owner.pendingConfig;owner.pendingConfig=null;}});
  }
+ /** Replace oversized text blocks with content-addressed references before planning. */
+ externalizeInput(input,agent,value){
+  const threshold=Number(value?.largeFileCharsThreshold??0);
+  if(!(threshold>0))return input;
+  const index=this.settings?.index;
+  if(!index)return input;
+  const {messages,files}=externalizeLargeBlocks(input.messages,{thresholdChars:threshold});
+  if(!files.length)return input;
+  try{
+   const dir=index.fileDir(agent.session.id);
+   for(const file of files){
+    const target=path.join(dir,file.id+'.txt');
+    if(!existsSync(target))writeFileSync(target,file.text,'utf8');
+    index.putFile({sessionId:agent.session.id,id:file.id,chars:file.chars,filePath:target,excerpt:file.text.slice(0,8192)});
+   }
+   this.diagnostics('compression.externalized','info',{files:files.length,chars:files.reduce((total,file)=>total+file.chars,0)});
+  }catch(error){
+   // Never drop content just because externalisation failed: keep the original input.
+   this.diagnostics('compression.externalize-failed','warn',{code:String(error?.code??error?.name??'unknown').slice(0,64)});
+   return input;
+  }
+  return {...input,messages};
+ }
  async prepare(input,agent,signal,value){
+  input=this.externalizeInput(input,agent,value);
   const routed=agent.session.requestHeader()?.config??agent.options,override=this.config.modelPolicies.find(policy=>policy.provider===routed.provider&&policy.model===routed.model)??{};
   const provider=(override.summarizationProvider??this.config.summarizationProvider)||routed.provider,model=(override.summarizationModel??this.config.summarizationModel)||routed.model;
   const info=await this.ctx.llm.resolveModelInfo(provider,model,signal),system=input.messages[0]?.role==='system'?input.messages[0]:null;
@@ -332,14 +360,14 @@ export default class LosslessCompaction extends BasicCompactionEngine {
   const {available}=summaryBudget(info,reserve,overhead);
   const plan=leafPlan(input,this.ctx.tokenMeter,Math.min(value.leafChunkTokens,available));
   if(plan.groups.length>256||plan.groups.some(group=>group.tokens>available))throw new Error('lcm-leaf-exceeds-summary-model-budget');
-  return {plan,available};
+  return {plan,available,input};
  }
  async summarizeLossless(input,agent,signal,settings,value){
   const index=settings.index;index.sync(agent.session);const compactionId=index.active(agent.session.id);if(!compactionId)throw new Error('lcm-native-compaction-marker-missing');
   const compressionStarted=performance.now();
   this.diagnostics('compression.started','info',{sessionId:agent.session.id,provider:agent.session.requestHeader()?.config?.provider,model:agent.session.requestHeader()?.config?.model,inputMessages:input.messages.length});
   let plan,available;
-  try{({plan,available}=await this.prepare(input,agent,signal,value));}
+  try{const prepared=await this.prepare(input,agent,signal,value);plan=prepared.plan;available=prepared.available;input=prepared.input??input;}
   catch(error){const code=summaryFailureCode(error);this.diagnostics('compression.failed','error',{code});this.diagnostics('compression.prepare-failed','error',{code});throw error;}
   const stage={prepareMs:Math.round(performance.now()-compressionStarted),leafCount:0,branchCount:0,cacheHits:0,modelCalls:0,modelMs:0};
   this.diagnostics('compression.plan','info',{prepareMs:stage.prepareMs,leafCount:plan.groups.length,inputMessages:input.messages.length});
@@ -355,7 +383,7 @@ export default class LosslessCompaction extends BasicCompactionEngine {
    if(!cached)this.remember(key,result,compactionId,agent.session.id);
    this.diagnostics('compression.stage','info',{kind,cacheHit:!!cached,durationMs});return result;
   };
-  if(plan.groups.length===1){const result=await run(input,'leaf');index.plan(agent.session.id,compactionId,{leaves:[{start:0,end:plan.groups[0].end,summary:summaryText(result)}]});this.diagnostics('compression.completed','info',{durationMs:Math.round(performance.now()-compressionStarted),...stage});return this.withRecallHint(result,value);}
+  if(plan.groups.length===1){const result=await run(input,'leaf');index.plan(agent.session.id,compactionId,{leaves:[{start:0,end:plan.groups[0].end,summary:summaryText(result)}]});this.diagnostics('compression.completed','info',{durationMs:Math.round(performance.now()-compressionStarted),...stage});return this.withRecallHint(result,value,{id:compactionId,kind:'leaf',depth:0,sources:input.messages.length||plan.groups[0].end,descendants:1});}
   for(const group of plan.groups){const result=await run({...input,messages:[...(plan.system?[plan.system]:[]),...group.messages]},'leaf');leaves.push({...group,messages:undefined,summary:summaryText(result),result});}
   const dag={leaves:leaves.map(({start,end,summary})=>({start,end,summary})),branches:[],rootChildren:[]};
   let layer=leaves.map((leaf,index)=>({id:'leaf:'+index,text:leaf.summary,result:leaf.result}));
@@ -377,7 +405,11 @@ export default class LosslessCompaction extends BasicCompactionEngine {
   const root=dag.branches.pop();dag.rootChildren=root.children;index.plan(agent.session.id,compactionId,dag);
   this.diagnostics('compression.completed','info',{durationMs:Math.round(performance.now()-compressionStarted),...stage});
   const result=layer[0].result;
-  return this.withRecallHint(result,value);
+  return this.withRecallHint(result,value,{id:compactionId,kind:'condensed',depth:Math.max(1,dag.branches.length),sources:leaves.reduce((total,leaf)=>total+Math.max(0,(leaf.end??0)-(leaf.start??0)),0),descendants:leaves.length});
  }
- withRecallHint(result,value){return value.promptAwareRecall?{...result,summary:[...result.summary,{type:'text',text:'需要精确原文时，可用 lcm_recall（action=search/describe/expand）检索或按摘要节点展开当前会话；超长工具原文可通过 DSH 提供的完整结果文件读取。'}]}:result;}
+ withRecallHint(result,value,meta={}){
+  const hint=value.promptAwareRecall?'需要精确原文时，可用 lcm_recall（action=search/describe/expand）；上面的 id 可直接用于 describe 或 expand。超长工具原文可通过 DSH 提供的完整结果文件读取。':'';
+  const body=hint?summaryText(result)+'\n\n'+hint:summaryText(result);
+  return {...result,summary:[{type:'text',text:summaryEnvelope({...meta,text:body})}]};
+ }
 }
