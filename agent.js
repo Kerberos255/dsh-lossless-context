@@ -8,6 +8,7 @@ import { externalizeLargeBlocks,leafPlan,summaryBudget,summaryEnvelope,summaryTe
 import { installRecall } from './recall.js';
 import { summarizeComplete } from './summarizer.js';
 import { warmBudget,scopedNativeConfig,deferredPressureBudget,retainedTailTokens } from './pressure.js';
+import { mapBounded } from './parallel-map.js';
 
 /** Preserve safe failure codes without persisting model output or provider messages. */
 export function summaryFailureCode(error){
@@ -162,7 +163,9 @@ export default class LosslessCompaction extends BasicCompactionEngine {
   this.postTurnAgents.delete(id);
   const abort=new AbortController(),owner=this.settings;
   this.postTurnAbort=abort;this.postTurnAgent=agent;
-  const task=this.runPostTurn(agent,abort.signal).then(()=>{
+  let shouldWarm=false;
+  const task=this.runPostTurn(agent,abort.signal).then(result=>{
+   shouldWarm=result==='below-threshold';
    this.postTurnBusyRetries.delete(id);this.postTurnRetryAt.delete(id);
   }).catch(error=>{
    if(abort.signal.aborted||error?.code==='cancelled'||error?.name==='AbortError'){
@@ -191,6 +194,9 @@ export default class LosslessCompaction extends BasicCompactionEngine {
    if(this.postTurnAbort===abort){this.postTurnAbort=null;this.postTurnAgent=null;}
    // Drain every pending session, not just the session that just finished.
    this.schedulePostTurns();
+   // A below-threshold no-op should not swallow the idle-prewarm opportunity.
+   // Do not warm after errors, cancellation or when newer turns are queued.
+   if(shouldWarm&&!this.pendingTurnEnds.size)this.scheduleIdleWarm(agent,1200);
   });
   this.postTurnTask=task;owner?.tasks.add(task);
  }
@@ -203,7 +209,7 @@ export default class LosslessCompaction extends BasicCompactionEngine {
   if(!info.context?.contextWindow)return;
   const override=this.config.modelPolicies.find(row=>row.provider===target.provider&&row.model===target.model)??{};
   const budget=deferredPressureBudget({window:info.context.contextWindow,output:target.maxTokens??info.defaultMaxTokens??0,thresholdRatio:this.config.thresholdRatio,headroomTokens:value.headroomTokens,headroomMode:value.headroomMode,override});
-  if(this.ctx.tokenMeter.measure(agent.session).totalTokens<budget.threshold){this.postTurnStatus='尚未达到任务后压缩阈值';return;}
+  if(this.ctx.tokenMeter.measure(agent.session).totalTokens<budget.threshold){this.postTurnStatus='尚未达到任务后压缩阈值';return 'below-threshold';}
   signal.throwIfAborted();
   const retainTokens=retainedTailTokens({window:info.context.contextWindow,output:target.maxTokens??info.defaultMaxTokens??0,config:this.config,override});
   this.postTurnStatus='任务结束后正在压缩';
@@ -370,13 +376,13 @@ export default class LosslessCompaction extends BasicCompactionEngine {
   try{const prepared=await this.prepare(input,agent,signal,value);plan=prepared.plan;available=prepared.available;input=prepared.input??input;}
   catch(error){const code=summaryFailureCode(error);this.diagnostics('compression.failed','error',{code});this.diagnostics('compression.prepare-failed','error',{code});throw error;}
   const stage={prepareMs:Math.round(performance.now()-compressionStarted),leafCount:0,branchCount:0,cacheHits:0,modelCalls:0,modelMs:0};
-  this.diagnostics('compression.plan','info',{prepareMs:stage.prepareMs,leafCount:plan.groups.length,inputMessages:input.messages.length});
+  this.diagnostics('compression.plan','info',{prepareMs:stage.prepareMs,leafCount:plan.groups.length,inputMessages:input.messages.length,concurrency:value.summaryConcurrency??3});
   const leaves=[];let ordinal=0;
-  const run=async(payload,kind)=>{
-   signal.throwIfAborted();const started=performance.now(),key=this.cacheKey(payload,agent,kind),cached=this.cached(key,agent.session.id);let result;
-   try{result=cached?{...cached.result,usage:undefined,rawOutput:undefined,llmStreamCall:false}:await this.completeSummary(payload,agent,signal,value,metadata=>index.auxiliary(agent.session.id,compactionId,ordinal++,'truncated',metadata),kind);}
+  const run=async(payload,kind,requestSignal=signal)=>{
+   requestSignal.throwIfAborted();const started=performance.now(),key=this.cacheKey(payload,agent,kind),cached=this.cached(key,agent.session.id);let result;
+   try{result=cached?{...cached.result,usage:undefined,rawOutput:undefined,llmStreamCall:false}:await this.completeSummary(payload,agent,requestSignal,value,metadata=>index.auxiliary(agent.session.id,compactionId,ordinal++,'truncated',metadata),kind);}
    catch(error){const code=summaryFailureCode(error);this.diagnostics('compression.failed','error',{code});this.diagnostics(kind==='condensed'?'compression.condensed-failed':'compression.leaf-failed','error',{code});throw error;}
-   signal.throwIfAborted();const durationMs=Math.round(performance.now()-started);
+   requestSignal.throwIfAborted();const durationMs=Math.round(performance.now()-started);
    if(kind==='leaf'){stage.leafCount++;this.warmStats.leafRequests++;if(cached)this.warmStats.leafHits++;}else stage.branchCount++;
    if(cached){stage.cacheHits++;this.warmStats.hits++;}else{stage.modelCalls++;stage.modelMs+=durationMs;}
    index.auxiliary(agent.session.id,compactionId,ordinal++,kind,{provider:result.provider,model:result.model,maxTokens:result.maxTokens,usage:result.usage??null,cachedFrom:cached?.source??null,estimatedOutputTokens:this.ctx.tokenMeter.estimateMessage({role:'assistant',content:result.summary}),durationMs});
@@ -384,15 +390,20 @@ export default class LosslessCompaction extends BasicCompactionEngine {
    this.diagnostics('compression.stage','info',{kind,cacheHit:!!cached,durationMs});return result;
   };
   if(plan.groups.length===1){const result=await run(input,'leaf');index.plan(agent.session.id,compactionId,{leaves:[{start:0,end:plan.groups[0].end,summary:summaryText(result)}]});this.diagnostics('compression.completed','info',{durationMs:Math.round(performance.now()-compressionStarted),...stage});return this.withRecallHint(result,value,{id:compactionId,kind:'leaf',depth:0,sources:input.messages.length||plan.groups[0].end,descendants:1});}
-  for(const group of plan.groups){const result=await run({...input,messages:[...(plan.system?[plan.system]:[]),...group.messages]},'leaf');leaves.push({...group,messages:undefined,summary:summaryText(result),result});}
+  const leafResults=await mapBounded(plan.groups,value.summaryConcurrency??3,(group,_index,requestSignal)=>run(leafPayload(input,plan,group),'leaf',requestSignal),signal);
+  for(let i=0;i<plan.groups.length;i++)leaves.push({...plan.groups[i],messages:undefined,summary:summaryText(leafResults[i]),result:leafResults[i]});
   const dag={leaves:leaves.map(({start,end,summary})=>({start,end,summary})),branches:[],rootChildren:[]};
   let layer=leaves.map((leaf,index)=>({id:'leaf:'+index,text:leaf.summary,result:leaf.result}));
   const estimate=item=>this.ctx.tokenMeter.estimateMessage({role:'user',content:[{type:'text',text:item.text}]});
   while(layer.length>1){
    const next=[];
-   for(const group of groupLayer(layer,{fanout:value.condenseFanout,available,estimate})){
-    if(group.length===1){next.push(group[0]);continue;}
-    const result=await run(condensedPayload(input,plan,group.map(item=>item.text)),'condensed');
+   const groups=groupLayer(layer,{fanout:value.condenseFanout,available,estimate});
+   const grouped=await mapBounded(groups,value.summaryConcurrency??3,async(group,_index,requestSignal)=>{
+    if(group.length===1)return {group};
+    return {group,result:await run(condensedPayload(input,plan,group.map(item=>item.text)),'condensed',requestSignal)};
+   },signal);
+   for(const {group,result} of grouped){
+    if(!result){next.push(group[0]);continue;}
     const id='branch:'+dag.branches.length,children=group.map(leaf=>leaf.id);dag.branches.push({id,children,summary:summaryText(result)});next.push({id,text:summaryText(result),result});
    }
    if(next.length>=layer.length){

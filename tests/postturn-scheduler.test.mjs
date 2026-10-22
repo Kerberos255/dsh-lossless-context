@@ -154,3 +154,31 @@ test('summary diagnostics classify failure stage without persisting provider err
  assert.equal(summaryFailureCode(new Error('unrecognized sensitive model response')),'SUMMARY_UNKNOWN');
  assert.equal(summaryFailureCode({code:'invalid key with secret',message:'private'}),'SUMMARY_UNKNOWN');
 });
+
+test('below-threshold post-turn starts prewarming after idle release',async()=>{
+ const engine=fixture(async()=> 'below-threshold');
+ const a=agent('warm-after-check'),queued=[];
+ engine.scheduleIdleWarm=(target,delay)=>queued.push([target,delay]);
+ engine.pendingTurnEnds.set(a.session.id,9);
+ engine.queuePostTurn(a,1);
+ await sleep(50);
+ assert.equal(engine.postTurnTask,null);
+ assert.deepEqual(queued,[[a,1200]]);
+ shutdown(engine);
+});
+
+test('post-turn errors, successful compression and newer turns never trigger old warm',async()=>{
+ for(const outcome of ['failed','compacted','new-turn']){
+  const engine=fixture(async()=>{
+   if(outcome==='failed')throw Object.assign(new Error('failed'),{code:'TRANSPORT'});
+   if(outcome==='new-turn'){engine.pendingTurnEnds.set(a.session.id,22);return 'below-threshold';}
+  });
+  const a=agent(outcome),queued=[];
+  engine.scheduleIdleWarm=()=>queued.push('unexpected');
+  engine.pendingTurnEnds.set(a.session.id,11);
+  engine.queuePostTurn(a,1);
+  await sleep(40);
+  assert.deepEqual(queued,[]);
+  shutdown(engine);
+ }
+});

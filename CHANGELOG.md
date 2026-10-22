@@ -24,3 +24,11 @@ See Git history for exact versions and commits. For current configuration, read 
 - Extend `lcm_recall` with a `files` scope: `search` scans externalised excerpts, `describe` returns a file record, `expand` reads stored text by offset. No additional tool was introduced.
 - Keep the standalone test suite runnable without the workspace settings page: those cases skip instead of failing when `_shared/plugin-settings` is absent.
 - Match `%`/`_` in file excerpts with an explicit `ESCAPE` clause, escape `&` and `<` in envelope attributes, and document `largeFileCharsThreshold` in the example configuration.
+
+## 0.1.38–0.1.39 · Concurrent compaction, idle preparation and recall safety
+
+- Independent leaf summaries and same-layer merges run with configurable bounded concurrency (1–3, default 3). DAG source order stays deterministic; failed calls cancel peers and do not publish an incomplete native compaction.
+- A post-turn threshold check that does not compact now schedules idle preparation, so the completed fragments can be cached and reused.
+- Escape summary-body XML delimiters. Externalized large text keeps a bounded head/middle/end preview; file search inspects up to the first 512 KiB of each of the 128 most recent files in the current session.
+- LCM diagnostics report allowlisted numeric timing, stage, model call and cache hit counters, without model output or transcript text.
+- Automated tests cover cancellation and DAG ordering; real-provider speed and quality still require live verification.

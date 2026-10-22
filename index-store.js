@@ -1,5 +1,5 @@
 import { DatabaseSync } from 'node:sqlite';
-import { mkdirSync } from 'node:fs';
+import { mkdirSync,openSync,readSync,closeSync } from 'node:fs';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
 
@@ -59,9 +59,26 @@ export class LosslessIndex {
  searchFiles(sessionId,query,limit=10){
   const needle=String(query??'').trim().slice(0,200);
   if(!needle)return [];
-  return this.db.prepare("SELECT id,chars,excerpt FROM lcm_files WHERE session_id=? AND excerpt LIKE ? ESCAPE '\\' ORDER BY created_at DESC LIMIT ?")
-   .all(sessionId,'%'+needle.replaceAll('%','\\%').replaceAll('_','\\_')+'%',limit)
-   .map(row=>({id:row.id,chars:row.chars,excerpt:row.excerpt.slice(0,400)}));
+  // Search a bounded prefix of each stored file, without copying its contents
+  // into SQLite. Never cross session scope or return file paths to the model.
+  const candidates=this.db.prepare('SELECT id,chars,excerpt,file_path FROM lcm_files WHERE session_id=? ORDER BY created_at DESC LIMIT 128').all(sessionId);
+  const results=[],normalizedNeedle=needle.toLowerCase();
+  for(const row of candidates){
+   let body=row.excerpt;
+   if(!body.toLowerCase().includes(normalizedNeedle)){
+    let fd;
+    try{
+     fd=openSync(row.file_path,'r');
+     const bytes=Buffer.allocUnsafe(512*1024),read=readSync(fd,bytes,0,bytes.length,0);
+     body=bytes.subarray(0,read).toString('utf8');
+    }catch{continue;}finally{if(fd!==undefined)closeSync(fd);}
+   }
+   const offset=body.toLowerCase().indexOf(normalizedNeedle);
+   if(offset<0)continue;
+   results.push({id:row.id,chars:row.chars,excerpt:body.slice(Math.max(0,offset-120),offset+Math.max(280,needle.length+120))});
+   if(results.length>=limit)break;
+  }
+  return results;
  }
  tx(fn){this.db.exec('BEGIN IMMEDIATE');try{const result=fn();this.db.exec('COMMIT');return result;}catch(error){this.db.exec('ROLLBACK');throw error;}}
  cursor(sessionId){return this.db.prepare('SELECT next_seq FROM lcm_cursor WHERE session_id=?').get(sessionId)?.next_seq??0;}

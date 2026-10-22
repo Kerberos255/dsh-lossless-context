@@ -73,3 +73,11 @@ The plugin optionally emits privacy-restricted operation and failure metadata to
 ## Editable compaction guidance
 
 Leaf and merged summaries can include customizable default quality guidance emphasizing project decisions, exact file paths/configuration names, validation evidence, and task state changes. A **Restore default** button resets the setting. Guidance supplements the native compaction protocol: tool pairing, source retention, cancellation and complete-transaction checks are unchanged. Changes to the summary policy invalidate stale reusable leaves.
+
+## Bounded concurrent summarization (0.1.39)
+
+Independent leaf summaries and same-layer merges use `summaryConcurrency` (default 3, range 1–3). Their results are assembled in source order; on failure the plugin stops pending calls and does not publish a partial native compaction. For rate-limited model providers, reduce concurrency to 1–2. After a turn ends below the formal threshold, idle summary preparation can resume for later reuse.
+
+Summary content is XML-escaped. Oversized text retains a bounded head/middle/end preview when externalized, and `lcm_recall` can search the first 512 KiB of each of at most 128 recent session-local files. The native transcript remains intact.
+
+Automated regression tests do not establish real-world model speed or summary fidelity; verify those on real sessions.

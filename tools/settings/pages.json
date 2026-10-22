@@ -88,6 +88,15 @@
         "max": 16
       },
       {
+        "key": "summaryConcurrency",
+        "label": "摘要并发数",
+        "group": "摘要与索引",
+        "type": "number",
+        "min": 1,
+        "max": 3,
+        "help": "默认 3；独立叶摘要与同层合并最多同时执行 3 个请求。若模型供应商限流，请调为 1–2；不改变原生会话提交机制。"
+      },
+      {
         "key": "leafTargetTokens",
         "label": "叶摘要目标长度（token）",
         "type": "number",
